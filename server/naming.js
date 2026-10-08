@@ -1,5 +1,5 @@
 import {id,db,one,run,query,decrypt,getSetting,utcNow} from './db.js';
-import {normalizedUsage,providerError,redact} from './provider.js';
+import {normalizedUsage,providerError,redact,authHeaders,requestSpec,generationUrl,geminiCandidate} from './provider.js';
 
 /**
  * Title generation only runs once, after the first successful assistant turn.
@@ -21,20 +21,24 @@ export async function autoNameFirstTurn(cid,emit){
   const transcript=[...(convo.system_prompt?['系統提示詞：'+convo.system_prompt.slice(0,1500)]:[]),...messages.map(m=>`${m.role==='user'?'使用者':'助理'}：${m.content.slice(0,3500)}`)].join('\n').slice(0,9000);
   const instructions='請依下列對話內容，提供一個簡短、具辨識度的繁體中文話題標題，最多 16 個中文字或 32 個字元。只回傳一行標題，不要引號、前綴、說明或 Markdown。';
   const key=decrypt(model.encrypted_key);
-  const headers={'Content-Type':'application/json',...(model.protocol==='openai'?{Authorization:'Bearer '+key}:{'x-api-key':key,'anthropic-version':'2023-06-01'})};
-  const body=model.protocol==='openai'
+  const headers={'Content-Type':'application/json',...authHeaders(model)};
+  const body=model.protocol==='gemini'
+   ?requestSpec(model,model.model_id,instructions,[{role:'user',content:transcript}]).body
+   :model.protocol==='openai'
    ?{model:model.model_id,stream:false,messages:[{role:'system',content:instructions},{role:'user',content:transcript}]}
    :{model:model.model_id,stream:false,max_tokens:128,system:instructions,messages:[{role:'user',content:transcript}]};
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort('title_timeout'),20000);
   let status='complete',rawUsage={},errorBody=null,httpStatus=null,errorCode=null,title=null;
   try{
-    const response=await fetch(model.endpoint,{method:'POST',headers,body:JSON.stringify(body),signal:controller.signal});
+    const response=await fetch(generationUrl(model,model.model_id,false),{method:'POST',headers,body:JSON.stringify(body),signal:controller.signal});
     const text=await response.text();
     if(!response.ok)throw providerError(response.status,text,key);
     const data=JSON.parse(text);
-    rawUsage=data.usage||{};
-    const value=model.protocol==='openai'?data.choices?.[0]?.message?.content:data.content?.filter(c=>c.type==='text').map(c=>c.text).join('');
+    rawUsage=(model.protocol==='gemini'?data.usageMetadata:data.usage)||{};
+    const value=model.protocol==='gemini'
+      ?geminiCandidate(data,key)?.content?.parts?.filter(p=>!p.thought&&typeof p.text==='string').map(p=>p.text).join('')
+      :model.protocol==='openai'?data.choices?.[0]?.message?.content:data.content?.filter(c=>c.type==='text').map(c=>c.text).join('');
     title=String(value||'').split(/[\r\n]/)[0].replace(/^[\s"'「『#*]+|[\s"'」』#*]+$/g,'').trim().slice(0,40);
     if(!title)throw Error('命名模型未回傳有效標題');
     const changed=run("UPDATE conversations SET title=?,updated_at=? WHERE id=? AND title_customized=0 AND auto_title_attempted=1 AND title IN ('新的對話','新對話')",title,utcNow(),cid);

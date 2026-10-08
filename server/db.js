@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS providers (
-  id TEXT PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL CHECK(protocol IN ('openai','claude')),
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL CHECK(protocol IN ('openai','claude','gemini')),
   endpoint TEXT NOT NULL UNIQUE, encrypted_key TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -49,6 +49,30 @@ CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(conversation_id,create
 CREATE INDEX IF NOT EXISTS idx_requests_convo ON requests(conversation_id,started_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
 `);
+// SQLite cannot alter a CHECK constraint. Rebuild only the parent table with
+// foreign keys disabled, preserving every ID and all dependent records.
+const providerSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='providers'").get().sql;
+if (!providerSchema.includes("'gemini'")) {
+  db.exec('PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;');
+  try {
+    db.exec(`CREATE TABLE providers_gemini_migration (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      protocol TEXT NOT NULL CHECK(protocol IN ('openai','claude','gemini')),
+      endpoint TEXT NOT NULL UNIQUE, encrypted_key TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO providers_gemini_migration SELECT id,name,protocol,endpoint,encrypted_key,created_at,updated_at FROM providers;
+    DROP TABLE providers;
+    ALTER TABLE providers_gemini_migration RENAME TO providers;`);
+    if (db.prepare('PRAGMA foreign_key_check').all().length) throw Error('Provider migration failed foreign key validation');
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  } finally {
+    db.exec('PRAGMA foreign_keys=ON');
+  }
+}
 // Add fields without recreating tables or dropping existing conversations.
 const requestColumns = new Set(db.prepare('PRAGMA table_info(requests)').all().map(c => c.name));
 for (const [name, definition] of [

@@ -36,6 +36,20 @@ OpenAI 相容 Endpoint 需填完整的 `https://host/v1/chat/completions`，Clau
 
 「匯出對話」包含對話、訊息、統計與錯誤紀錄；「匯出設定」包含端點、模型與偏好，但**不包含 Key**。完整資料備份請保存 `data/` SQLite 檔與 `.env`（加密 Key 必須完整保留），妥善保護備份。
 
+## Gemini 原生 API
+
+管理中心新增 Endpoint 時，協定選擇 **Gemini 原生**，Endpoint 填 `https://generativelanguage.googleapis.com/v1beta`，API Key 填入獨立的密碼欄位。支援以 `/v1` 或 `/v1beta` 結尾的相容中轉基底 URL；貼入 `/models` 或完整 `:generateContent` / `:streamGenerateContent` URL 時會轉為基底 URL。URL 不可包含 `?key=...` 或其他查詢參數，金鑰只透過 `x-goog-api-key` Header 傳送。
+
+- 模型偵測呼叫 `/models` 並讀取所有分頁，排除僅支援嵌入等非內容生成的模型；保存 Model ID 時移除 `models/` 前綴，也可手動新增模型。
+- 聊天依選定模型呼叫 `/models/{model}:streamGenerateContent?alt=sse`，將使用者／助理歷史轉為 `user` / `model` 的 `contents`，System Prompt 使用 `systemInstruction`。支援現有背景生成、持久佇列、停止與 SSE 斷線重播。
+- 僅 `parts[].thought=true` 的文字顯示為思考摘要；`thoughtSignature` 不顯示，也不保存重播。此版本限純文字對話，未加入工具呼叫、圖片或音訊。
+- 成功結束以候選回覆的 `finishReason=STOP` 或 `MAX_TOKENS` 為準；後者保留截斷回答及結束原因。提前斷線、提示詞阻擋、其他異常結束和 API 錯誤會保存錯誤並暫停該對話佇列。
+- 使用量保存 `usageMetadata` 明確提供的輸入、回答、快取讀取、思考與總 Token。Gemini 回答 Token 不包含獨立的思考 Token，總量直接使用供應商的 `totalTokenCount`，缺少的欄位仍為未知。
+- Gemini 也可選為自動命名模型，使用非串流 `:generateContent`，獨立保存命名用量。
+- 啟動時自動更新舊 SQLite 的供應商協定限制；保留既有端點、加密 Key、模型、對話、請求與佇列的關聯。
+
+官方格式參考：[內容生成 REST API](https://ai.google.dev/api/generate-content)、[模型列表](https://ai.google.dev/api/models)、[思考設定](https://ai.google.dev/gemini-api/docs/generate-content/thinking)。實際 Google API 的模型可用性、額度與中轉相容性仍需使用自己的憑證驗證。
+
 ## 每次訊息選擇思考額度
 
 聊天輸入框底部有「思考額度」選單；每次點擊傳送時會**連同訊息**保存選擇，對話佇列中的後續選擇不會覆蓋已排隊訊息的額度。切換聊天視窗時，每個聊天保留各自的前端選擇（重新整理頁面會恢復為 API 預設）。
@@ -44,7 +58,9 @@ OpenAI 相容 Endpoint 需填完整的 `https://host/v1/chat/completions`，Clau
 - **OpenAI 相容 /chat/completions**：依選擇傳送 `reasoning_effort`（`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`）。不是每個模型都支援所有值；不支援時會顯示供應商原始錯誤。
 - **Claude 4.6 及更新的模型**：傳送 `thinking: {type: "adaptive"}`、`output_config: {effort: "low" | "medium" | "high" | "xhigh" | "max"}`；模型的允許值依供應商而定。
 - **已辨識的 Claude 4.5 及以前模型**：思考等級對應至手動 `thinking: {type: "enabled", budget_tokens: N}`（低 1024、中 4096、高 8192、極高 16384、最大 32768），預留至少 2048 token 作為回覆空間。第三方非標準 Model ID 可以選擇「自訂 Token 預算」，發送相同的手動 thinking 格式。
-- **自訂 Token 預算**：僅 Claude 相容 Endpoint，允許 1024～32768 的整數。Claude 4.6 目前已棄用手動 thinking，4.7 以上不支援；在這些模型選自訂額度可能會收到 HTTP 400。
+- **Claude 自訂 Token 預算**：允許 1024～32768 的整數。Claude 4.6 目前已棄用手動 thinking，4.7 以上不支援；在這些模型選自訂額度可能會收到 HTTP 400。
+- **Gemini 3 及更新模型**：傳送 `generationConfig.thinkingConfig.thinkingLevel`（`minimal`、`low`、`medium`、`high`）與 `includeThoughts: true`。各模型允許值不同，不支援的選擇會顯示供應商錯誤；不將 `minimal` 當成保證關閉思考。
+- **Gemini 2.5**：等級對應至 `thinkingBudget`（最低 512、低 1024、中 4096、高 8192），或使用自訂整數預算。Flash／Flash-Lite 上限 24576，Pro 上限 32768 且最低 128、不可關閉思考；Flash-Lite 非零預算至少 512。Flash／Flash-Lite 可選「關閉」傳送 0。API 預設不附加思考設定。
 - SQLite `requests` 表以非破壞性的 schema migration 增加 `thinking_mode`、`thinking_effort`、`thinking_budget_tokens`，每次訊息都記錄所要求的設定；這不是模型實際消耗的推理 token 數。實際使用量仍只採用上游傳回的數值。
 
 官方參考：[OpenAI Chat Completions reasoning_effort](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[Claude extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)、[Claude effort](https://platform.claude.com/docs/en/build-with-claude/effort)。
@@ -89,7 +105,7 @@ OpenAI 相容 Endpoint 需填完整的 `https://host/v1/chat/completions`，Clau
 
 在管理中心的「新對話自動命名」選擇已啟用的模型，按「儲存命名設定」即可生效；選擇「停用自動命名」則不會發送額外命名請求。
 
-- 僅在**新對話第一輪助理回答成功完成**後嘗試一次，使用當前對話的第一輪使用者訊息與助理完整回覆（有長度保護），向指定模型另送一次**非串流** OpenAI Chat Completions 或 Claude Messages 請求。
+- 僅在**新對話第一輪助理回答成功完成**後嘗試一次，使用當前對話的第一輪使用者訊息與助理完整回覆（有長度保護），向指定模型另送一次**非串流** OpenAI Chat Completions、Claude Messages 或 Gemini GenerateContent 請求。
 - 命名模型可與聊天模型不同，並使用各自 Endpoint/API Key。要求模型只產生一行簡短繁體中文標題；移除外層引號、截斷過長內容，成功後自動改標題並透過 SSE `title` 事件同步。
 - 若已人工重新命名，就不會再被自動命名覆蓋。命名失敗或所選模型不支援該非串流格式，也不影響聊天正常完成；已啟動的命名請求不會反覆重試。
 - 命名請求與使用量獨立寫入 `requests`，`kind='naming'`，僅統計供應商確實回傳的 Token，不會推估。
@@ -103,5 +119,5 @@ SSE 事件逐條保存在 SQLite，可斷線補收；高頻增量會增加資料
 
 ## 尚待驗證
 
-- 真實 OpenAI/Claude 官方與第三方端點的串流完成事件、Token 使用量及中斷行為，需有實際憑證才能做整合測試。
+- 真實 OpenAI/Claude/Gemini 官方與第三方端點的串流完成事件、Token 使用量及中斷行為，需有實際憑證才能做整合測試。
 - OpenAI Responses API（/responses）與多模態不是首版支援範圍。
