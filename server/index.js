@@ -3,6 +3,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
+import {setStaticCacheHeaders} from './static-cache.js';
 import {db,id,query,one,run,encrypt,publicProvider,utcNow,getSetting,setSetting} from './db.js';
 import {validateEndpoint,discoverModels,redact} from './provider.js';
 import {enqueue,queueState,subscribe,stop,running,kick,resume,cancel,recoverQueue,isActive,emit} from './queue.js';
@@ -144,6 +145,6 @@ app.post('/api/conversations/:id/send',auth,(req,res)=>{
  });
 });
 recoverQueue();
-app.use(express.static(path.resolve('dist'),{index:false}));
+app.use(express.static(path.resolve('dist'),{index:false,setHeaders:setStaticCacheHeaders}));
 app.get('/{*any}',(req,res)=>{const p=path.resolve('dist/index.html');if(fs.existsSync(p))res.sendFile(p);else res.status(503).send('Frontend is not built. Run npm run build.');});
 const port=Number(process.env.PORT||3000);app.listen(port,process.env.HOST||'0.0.0.0',()=>console.log(`AI Station listening on ${process.env.HOST||'0.0.0.0'}:${port}`));

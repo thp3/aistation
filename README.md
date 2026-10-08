@@ -26,7 +26,18 @@ sudo systemctl status aistation
 
 後續更新：`bash scripts/update.sh`。建議以一般使用者安裝程式與資料目錄，並由 sudo 建立 systemd 單元。更新前會備份 SQLite。腳本不負責安裝 Node.js；請先安裝 24+，並確保服務使用者對目錄有寫入權限。
 
-## 管理設定
+## 聊天操作與瀏覽器效能
+
+- 每個對話的未送出草稿會在瀏覽器本機保存，切換模型、對話、管理頁或重新整理後可恢復；刪除對話也會清除該對話草稿。草稿仍未進入伺服器佇列，不會自動送出，也不跨裝置同步。瀏覽器停用本機儲存時，只能在目前頁面的記憶體保留。
+- 訊息送出等待確認時，可繼續輸入下一則草稿；較晚回來的確認只會清除沒有再修改過的原草稿。送出中的同一對話暫時禁止重複提交，其他對話仍可操作。
+- 快速切換對話會取消前一次載入，且忽略過期回應。載入期間顯示狀態，失敗可重試。
+- 串流文字每 50ms 合併更新正在生成的訊息；歷史訊息保留既有 DOM 與渲染結果。閱讀上方內容時不會被強制捲到底部，可按「回到最新訊息」恢復追蹤；切換頁面也保留閱讀位置。
+- 手機版持續顯示「＋」新增對話按鈕，使用動態視窗高度、適配安全區域及觸控輸入字級。軟鍵盤、瀏覽器工具列和安全區域仍需在實際手機確認。
+- 正式建置的帶內容雜湊 JS、CSS 與字型檔可長期快取；HTML、登入及私人 API 仍使用 `no-store`。
+
+開發驗證：`npm run check`、`npm test`、`npm run build`。另外提供 `npm run test:ui` 瀏覽器回歸測試，覆蓋草稿、延遲送出確認、切換競爭、串流 DOM／捲動保留、手機新增入口與 HTTP 快取。需先建置並另備 Playwright（例如 `npm install --no-save --package-lock=false playwright` 和 `npx playwright install chromium`）；也可用 `PLAYWRIGHT_MODULE` 指定既有 Playwright 的 `index.mjs` 路徑，或以 `PLAYWRIGHT_CHANNEL=chrome` 使用已安裝的 Chrome。
+
+## 端點與模型設定
 
 OpenAI 相容 Endpoint 需填完整的 `https://host/v1/chat/completions`，Claude 相容則 `https://host/v1/messages`。模型偵測會呼叫同一路徑衍生的 `/models`；部分中轉站不支援此路徑，請手動新增 Model ID。新增 Endpoint 時會自動嘗試偵測並加入模型；後續只有按「偵測」才會重新查詢，聊天從 SQLite 讀模型清單。若第三方中轉站不支援模型列表 API，請手動新增。模型唯一性使用 provider record + Model ID，而提供者 Endpoint 在資料庫中唯一，因此相當於 Endpoint + Model ID。
 
