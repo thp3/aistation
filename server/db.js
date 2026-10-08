@@ -62,6 +62,42 @@ const messageColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().m
 if (!messageColumns.has('thinking_content')) {
   db.exec("ALTER TABLE messages ADD COLUMN thinking_content TEXT NOT NULL DEFAULT ''");
 }
+const convoColumns = new Set(db.prepare('PRAGMA table_info(conversations)').all().map(c=>c.name));
+for (const [name,definition] of [
+  ['title_customized','INTEGER NOT NULL DEFAULT 0'],
+  ['auto_title_attempted','INTEGER NOT NULL DEFAULT 0']
+]) if(!convoColumns.has(name))db.exec(`ALTER TABLE conversations ADD COLUMN ${name} ${definition}`);
+const requestColumns2 = new Set(db.prepare('PRAGMA table_info(requests)').all().map(c=>c.name));
+if(!requestColumns2.has('kind'))db.exec("ALTER TABLE requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'");
+db.exec(`
+CREATE TABLE IF NOT EXISTS queue_jobs (
+ id TEXT PRIMARY KEY,
+ conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ fingerprint TEXT NOT NULL,
+ content TEXT NOT NULL,
+ provider_id TEXT REFERENCES providers(id) ON DELETE SET NULL,
+ model_id TEXT NOT NULL,
+ system_prompt TEXT NOT NULL DEFAULT '',
+ thinking_json TEXT NOT NULL,
+ state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued','running','complete','error','stopped','cancelled')),
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ started_at TEXT,finished_at TEXT, error_text TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_queue_jobs_convo ON queue_jobs(conversation_id,state,created_at,id);
+CREATE TABLE IF NOT EXISTS queue_pauses (
+ conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+ reason TEXT NOT NULL DEFAULT 'error'
+);
+CREATE TABLE IF NOT EXISTS queue_events (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ job_id TEXT,
+ event TEXT NOT NULL,
+ payload TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_queue_events_convo_seq ON queue_events(conversation_id,seq);
+`);
 export const id = () => crypto.randomUUID();
 const secret = process.env.DATA_ENCRYPTION_KEY;
 if (!secret || secret.length < 32) throw new Error('DATA_ENCRYPTION_KEY must be at least 32 characters');

@@ -7,6 +7,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {randomUUID} from 'node:crypto';
+import {sendAndWait,readEvents} from './queue-test-helper.js';
 
 async function listen(server) {
  server.listen(0,'127.0.0.1');
@@ -86,6 +88,7 @@ test('request thinking setting reaches OpenAI/Claude mock endpoints and is store
    assert.equal(login.status,200);
    const cookie=login.headers.get('set-cookie').split(';')[0];
    async function req(uri,method='GET',body) {
+     if(method==='POST'&&uri.endsWith('/send'))return sendAndWait(base,cookie,req,uri.split('/')[2],body);
      const response=await fetch(base+'/api'+uri,{method,headers:{Cookie:cookie,'Content-Type':'application/json'},
        ...(body===undefined?{}:{body:JSON.stringify(body)})});
      return {status:response.status,data:response.headers.get('content-type')?.includes('text/event-stream')?await response.text():await response.json()};
@@ -116,22 +119,19 @@ test('request thinking setting reaches OpenAI/Claude mock endpoints and is store
    assert.equal(incompleteRecord.data.messages.at(-1).status,'error');
 
    const stoppedConversation=await req('/conversations','POST',{title:'Stopped',provider_id:openai.data.id,model_id:'gpt-test'});
+   const beforeStop=await req('/conversations/'+stoppedConversation.data.id);
    const streamResponse=await fetch(base+'/api/conversations/'+stoppedConversation.data.id+'/send',{
      method:'POST',headers:{Cookie:cookie,'Content-Type':'application/json'},
-     body:JSON.stringify({content:'stop me'}),
-     signal:AbortSignal.timeout(6000)
+     body:JSON.stringify({content:'stop me',idempotency_key:randomUUID()})
    });
-   assert.equal(streamResponse.status,200);
-   const reader=streamResponse.body.getReader(),decoder=new TextDecoder();
-   let streamText='';
-   while(!streamText.includes('event: thinking_delta')){
-     const {done,value}=await reader.read();
-     if(done)throw Error('SSE stream ended before partial thinking arrived');
-     streamText+=decoder.decode(value,{stream:true});
-   }
-   const stop=await req('/conversations/'+stoppedConversation.data.id+'/stop','POST');
+   assert.equal(streamResponse.status,202);
+   let stopPromise=null;
+   const streamText=await readEvents(base,cookie,stoppedConversation.data.id,beforeStop.data.event_cursor||0,(event)=>{
+      if(event==='thinking_delta'&&!stopPromise)stopPromise=req('/conversations/'+stoppedConversation.data.id+'/stop','POST');
+      return event==='stopped';
+   },{timeout:6000});
+   const stop=await stopPromise;
    assert.equal(stop.data.stopping,true);
-   while(true){const {done,value}=await reader.read();if(done)break;streamText+=decoder.decode(value,{stream:true})}
    assert.match(streamText,/event: stopped/);
    const stoppedSaved=await req('/conversations/'+stoppedConversation.data.id);
    assert.equal(stoppedSaved.data.messages.at(-1).status,'stopped');

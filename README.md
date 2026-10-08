@@ -30,7 +30,7 @@ sudo systemctl status aistation
 
 OpenAI 相容 Endpoint 需填完整的 `https://host/v1/chat/completions`，Claude 相容則 `https://host/v1/messages`。模型偵測會呼叫同一路徑衍生的 `/models`；部分中轉站不支援此路徑，請手動新增 Model ID。新增 Endpoint 時會自動嘗試偵測並加入模型；後續只有按「偵測」才會重新查詢，聊天從 SQLite 讀模型清單。若第三方中轉站不支援模型列表 API，請手動新增。模型唯一性使用 provider record + Model ID，而提供者 Endpoint 在資料庫中唯一，因此相當於 Endpoint + Model ID。
 
-聊天 SSE 事件：`started`, `delta`, `complete`, `error`, `stopped`。停止生成會保留已產生的文字。前端排程為每聊天獨立記憶體 FIFO，換頁時保留但**重新整理網頁即清除尚未發送訊息**；伺服器不會儲存未送出佇列。失敗時暫停該對話佇列，保留其他待送訊息；可按「繼續傳送」恢復排程。任何一對話同時僅允許一個後端串流。
+聊天排程現由 **SQLite 後端持久化 FIFO** 管理，每個對話的待發送訊息在關閉瀏覽器或 VPS 重啟後仍保存；不同對話可並行，單一對話一次只執行一個上游請求。失敗則暫停該對話佇列，可手動恢復；尚未執行的訊息可取消。每次送出要求提供 UUID `idempotency_key`，相同 Key 與內容只建立一次任務，不同內容重複使用同一 Key 會回 HTTP 409。
 
 使用量僅記錄上游明確提供的數值，未知為 NULL；統計 SQL SUM 忽略 NULL，若混合已知與未知數值，總和為**已知部分之和，並非真實完整總量**。成功與失敗請求各自留存狀態。OpenAI / Claude 的第三方中轉站可能有不相容事件或 token 欄位，需要個別驗證。
 
@@ -51,16 +51,19 @@ OpenAI 相容 Endpoint 需填完整的 `https://host/v1/chat/completions`，Clau
 
 ## SSE 即時思考顯示與斷線保護
 
-已支援雙向增量串流（瀏覽器透過 `fetch` 讀取 POST 回應，不使用只能 GET 的 EventSource）。伺服器將上游 OpenAI / Claude 事件轉成以下 SSE 事件：
+現在使用 **POST 建立佇列工作 + GET EventSource** 續接串流。`POST /api/conversations/:id/send` 回 HTTP 202 JSON，不再持續佔用 POST 連線。登入後，GET `/api/conversations/:id/events?after=<seq>` 會重播 SQLite 事件日誌中游標之後的事件，並持續接收新增事件；斷線重連支援標準 `Last-Event-ID`。伺服器將上游 OpenAI / Claude 事件轉成以下 SSE 事件：
 
 | SSE 事件 | 內容 |
 |---|---|
-| `started` | 請求 ID、對話訊息 ID、使用的思考額度 |
+| `queued` | 已進入持久佇列，尚未向供應商發送 |
+| `started` | 開始執行，提供請求 ID、對話訊息 ID |
 | `thinking_delta` | 僅供應商明確回傳的可閱讀思考／摘要增量 |
 | `delta` | 正式回答文字增量 |
 | `complete` | 上游正式完成並保留 Token 使用量 |
 | `stopped` | 使用者停止生成，保存部分思考與回答 |
-| `error` | HTTP／供應商錯誤碼與已產生的部分內容 |
+| `error` | HTTP／供應商錯誤碼與已產生的部分內容；後續工作暫停 |
+| `cancelled` / `resumed` | 待發送工作取消／對話佇列恢復 |
+| `title` | 命名模型完成並更新對話標題 |
 
 - Claude 相容 API 讀取 `thinking_delta` 和 `text_delta`；有選擇思考額度時設定 `thinking.display: "summarized"`，讓支援此參數的模型回傳可閱讀的思考摘要。簽章 `signature_delta` 為驗證資料，不會顯示給使用者，也不當成推理文字。
 - OpenAI 官方 Chat Completions 通常**不提供可閱讀的內部推理文字**；只有第三方相容端點真正回傳 `choices[].delta.reasoning_content`、`reasoning` 或 `thinking` 時，才會顯示思考內容。不會由 Token 數推導或捏造思考過程。
@@ -78,9 +81,21 @@ OpenAI 相容 Endpoint 需填完整的 `https://host/v1/chat/completions`，Clau
 - **刪除歷史訊息**：刪除指定訊息後，下一次 API 請求不再附帶該段上下文；舊請求 Token 統計與供應商請求紀錄仍保留。
 - **回退至此**：僅使用者訊息有「回退至此」，確認後**永久刪除該則使用者訊息及其之後所有訊息**，原訊息放回輸入框，修改後可重新發送。回退同時清除該聊天視窗尚未發送的前端佇列；原始 API 用量歷史不會刪除。建議回退前匯出 JSON 備份。
 - **並行隔離**：生成中的聊天禁止編輯、刪除或回退歷史訊息（HTTP 409），不同聊天可同時生成；只刪除指定聊天歷史不影響其他聊天。
-- **限制**：這是 **VPS Node.js 程序仍在執行期間** 的背景任務，不是外部持久化佇列或跨伺服器重啟自動重試。若伺服器重啟，未完成任務被標記 `SERVER_RESTARTED`，已寫入的部分文字保留，必須自行重送。尚未傳送出去的**前端 FIFO 佇列**仍保存在該瀏覽器分頁記憶體，重新整理或關閉頁面會丟失，並不會在背景自動傳送。只有**已送至後端**的請求會繼續生成。
+- **持久化佇列與重啟策略**：已由 SQLite 保存尚未執行的排隊訊息，關閉瀏覽器仍依 FIFO 自動送出。重啟時，排隊狀態的工作會在未暫停時自動恢復；正在執行中的請求因上游結果無法確認，標記為 `SERVER_RESTARTED` 並暫停同一對話佇列，**不自動重新發送**，避免重複計費。需登入後手動按「繼續傳送」處理後續訊息。尚未到達後端的本地編輯草稿不是排隊任務。
 
-相關 API：`GET /api/generations`、`PATCH /api/conversations/:id/messages/:messageId`、`DELETE /api/conversations/:id/messages/:messageId`、`POST /api/conversations/:id/rewind`（`{ "message_id": "..." }`）。
+相關 API：`POST /api/conversations/:id/send`（`{ "idempotency_key": "UUID", "content": "...", "thinking": { "mode": "default" } }`）、`GET /api/conversations/:id/events?after=序號`、`GET /api/conversations/:id/jobs/:jobId`、`DELETE /api/conversations/:id/queue/:jobId`、`POST /api/conversations/:id/queue/resume`、`GET /api/generations`、`PATCH /api/conversations/:id/messages/:messageId`、`DELETE /api/conversations/:id/messages/:messageId`、`POST /api/conversations/:id/rewind`（`{ "message_id": "..." }`）。
+
+## 管理後臺指定自動命名模型
+
+在管理中心的「新對話自動命名」選擇已啟用的模型，按「儲存命名設定」即可生效；選擇「停用自動命名」則不會發送額外命名請求。
+
+- 僅在**新對話第一輪助理回答成功完成**後嘗試一次，使用當前對話的第一輪使用者訊息與助理完整回覆（有長度保護），向指定模型另送一次**非串流** OpenAI Chat Completions 或 Claude Messages 請求。
+- 命名模型可與聊天模型不同，並使用各自 Endpoint/API Key。要求模型只產生一行簡短繁體中文標題；移除外層引號、截斷過長內容，成功後自動改標題並透過 SSE `title` 事件同步。
+- 若已人工重新命名，就不會再被自動命名覆蓋。命名失敗或所選模型不支援該非串流格式，也不影響聊天正常完成；已啟動的命名請求不會反覆重試。
+- 命名請求與使用量獨立寫入 `requests`，`kind='naming'`，僅統計供應商確實回傳的 Token，不會推估。
+- 現有對話不會批次改名；重新編輯或回退已命名對話不會再次觸發命名。
+
+SSE 事件逐條保存在 SQLite，可斷線補收；高頻增量會增加資料庫大小，應定期監看磁碟空間與備份。單一 VPS Node.js 程序／SQLite 為目前部署目標；若要多工作程序橫向擴展，需另行設計跨程序工作鎖與事件通知。
 
 ## 安全
 

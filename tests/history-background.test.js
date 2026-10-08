@@ -8,6 +8,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {randomUUID} from 'node:crypto';
+import {sendAndWait} from './queue-test-helper.js';
 
 const project=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -60,6 +62,7 @@ test('detached SSE survives browser close and edits, deletes, rewinds actual con
   assert.equal(login.status,200,stderr);
   const cookie=login.headers.get('set-cookie').split(';')[0];
   async function request(url,method='GET',payload){
+   if(method==='POST'&&url.endsWith('/send'))return sendAndWait(base,cookie,request,url.split('/')[2],payload);
    const response=await fetch(base+'/api'+url,{
     method,headers:{Cookie:cookie,'Content-Type':'application/json'},
     ...(payload===undefined?{}:{body:JSON.stringify(payload)})
@@ -73,11 +76,13 @@ test('detached SSE survives browser close and edits, deletes, rewinds actual con
   const chat=await request('/conversations','POST',{title:'測試對話',provider_id:provider.data.id,model_id:'mock-model'});
   assert.equal(chat.status,201);
   const cid=chat.data.id;
+  const cursor=(await request('/conversations/'+cid)).data.event_cursor;
   const response=await fetch(base+'/api/conversations/'+cid+'/send',{
-   method:'POST',headers:{Cookie:cookie,'Content-Type':'application/json'},body:JSON.stringify({content:'背景測試'})
+   method:'POST',headers:{Cookie:cookie,'Content-Type':'application/json'},body:JSON.stringify({content:'背景測試',idempotency_key:randomUUID()})
   });
-  assert.equal(response.status,200);
-  const reader=response.body.getReader();
+  assert.equal(response.status,202);
+  const eventsResponse=await fetch(base+'/api/conversations/'+cid+'/events?after='+cursor,{headers:{Cookie:cookie}});
+  const reader=eventsResponse.body.getReader();
   const first=await reader.read();
   assert.match(new TextDecoder().decode(first.value),/event: started/);
   // Browser loses the network link, but the upstream stream must keep going.

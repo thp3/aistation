@@ -4,10 +4,8 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import {db,id,query,one,run,encrypt,publicProvider,utcNow,getSetting,setSetting} from './db.js';
-import {validateEndpoint,discoverModels,streamProvider,normalizedUsage,redact} from './provider.js';
-import {resolveThinking} from './thinking.js';
-// Streaming network connections are observers, not owners of provider jobs.
-const active=new Map();
+import {validateEndpoint,discoverModels,redact} from './provider.js';
+import {enqueue,queueState,subscribe,stop,running,kick,resume,cancel,recoverQueue,isActive,emit} from './queue.js';
 // A process restart cannot resume an upstream HTTP connection. Mark stale work
 // interrupted instead of leaving conversations indefinitely "generating".
 run("UPDATE requests SET status='error',provider_error_code='SERVER_RESTARTED',error_body='伺服器重新啟動，原生成連線已中斷',finished_at=? WHERE status='running'",utcNow());
@@ -35,19 +33,59 @@ app.get('/api/models',auth,(req,res)=>res.json(query('SELECT m.*,p.name AS provi
 app.post('/api/models',auth,(req,res)=>{const {provider_id,model_id}=req.body;if(!one('SELECT id FROM providers WHERE id=?',provider_id)||!String(model_id||'').trim())return res.status(400).json({error:'無效模型'});try{run("INSERT INTO models(id,provider_id,model_id,source) VALUES(?,?,?,'manual') ON CONFLICT(provider_id,model_id) DO UPDATE SET source='manual',enabled=1,updated_at=excluded.updated_at",id(),provider_id,String(model_id).trim());res.status(201).json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
 app.patch('/api/models/:id',auth,(req,res)=>{run('UPDATE models SET enabled=? WHERE id=?',req.body.enabled?1:0,req.params.id);res.json({ok:true})});
 app.delete('/api/models/:id',auth,(req,res)=>{run('DELETE FROM models WHERE id=?',req.params.id);res.json({ok:true})});
-app.get('/api/settings',auth,(req,res)=>res.json({default_system_prompt:getSetting('default_system_prompt')}));
-app.patch('/api/settings',auth,(req,res)=>{setSetting('default_system_prompt',String(req.body.default_system_prompt||''));res.json({ok:true})});
+app.get('/api/settings',auth,(req,res)=>res.json({default_system_prompt:getSetting('default_system_prompt'),naming_model_id:getSetting('naming_model_id')}));
+app.patch('/api/settings',auth,(req,res)=>{
+ if(Object.hasOwn(req.body,'default_system_prompt'))setSetting('default_system_prompt',String(req.body.default_system_prompt||''));
+ if(Object.hasOwn(req.body,'naming_model_id')){
+   const mid=String(req.body.naming_model_id||'');
+   if(mid&&!one('SELECT 1 FROM models WHERE id=? AND enabled=1',mid))return res.status(400).json({error:'命名模型不存在或未啟用'});
+   setSetting('naming_model_id',mid);
+ }
+ res.json({ok:true});
+});
 const convoSql='SELECT * FROM conversations';
 app.get('/api/conversations',auth,(req,res)=>res.json(query(convoSql+' ORDER BY updated_at DESC')));
-app.post('/api/conversations',auth,(req,res)=>{const cid=id();const system=String(req.body.system_prompt??getSetting('default_system_prompt'));run('INSERT INTO conversations(id,title,system_prompt,provider_id,model_id) VALUES(?,?,?,?,?)',cid,String(req.body.title||'新的對話').slice(0,120),system,req.body.provider_id||null,req.body.model_id||null);res.status(201).json(one(convoSql+' WHERE id=?',cid))});
-app.get('/api/conversations/:id',auth,(req,res)=>{const c=one(convoSql+' WHERE id=?',req.params.id);if(!c)return res.sendStatus(404);res.json({...c,messages:query('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at,rowid',c.id),requests:query('SELECT * FROM requests WHERE conversation_id=? ORDER BY started_at',c.id)})});
-app.get('/api/generations',auth,(req,res)=>res.json({active:[...active.entries()].map(([conversation_id,job])=>({conversation_id,request_id:job.request_id,started_at:job.started_at}))}));
+app.post('/api/conversations',auth,(req,res)=>{const cid=id();const system=String(req.body.system_prompt??getSetting('default_system_prompt'));run('INSERT INTO conversations(id,title,system_prompt,provider_id,model_id,title_customized) VALUES(?,?,?,?,?,?)',cid,String(req.body.title||'新的對話').slice(0,120),system,req.body.provider_id||null,req.body.model_id||null,req.body.title?1:0);res.status(201).json(one(convoSql+' WHERE id=?',cid))});
+app.get('/api/conversations/:id',auth,(req,res)=>{
+ const c=one(convoSql+' WHERE id=?',req.params.id);if(!c)return res.sendStatus(404);
+ res.json({...c,messages:query('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at,rowid',c.id),
+  requests:query('SELECT * FROM requests WHERE conversation_id=? ORDER BY started_at',c.id),
+  queue:queueState(c.id),event_cursor:one('SELECT MAX(seq) AS seq FROM queue_events WHERE conversation_id=?',c.id)?.seq||0});
+});
+app.get('/api/generations',auth,(req,res)=>res.json({active:running()}));
+app.get('/api/conversations/:id/jobs/:jobId',auth,(req,res)=>{
+ const job=one('SELECT id,state,created_at,started_at,finished_at,error_text FROM queue_jobs WHERE conversation_id=? AND id=?',req.params.id,req.params.jobId);
+ if(!job)return res.sendStatus(404);
+ res.json(job);
+});
+app.get('/api/conversations/:id/events',auth,(req,res)=>{
+ const cid=req.params.id;if(!one('SELECT 1 FROM conversations WHERE id=?',cid))return res.sendStatus(404);
+ const raw=req.get('Last-Event-ID')||req.query.after||'0';
+ const after=Number(raw);
+ if(!Number.isSafeInteger(after)||after<0)return res.status(400).json({error:'無效事件游標'});
+ res.status(200).set({'Content-Type':'text/event-stream; charset=utf-8','Connection':'keep-alive','Cache-Control':'no-cache, no-transform','X-Accel-Buffering':'no'});
+ res.flushHeaders();
+ res.write('retry: 1500\n\n');
+ const write=e=>{if(!res.destroyed&&!res.writableEnded)res.write(`id: ${e.seq}\nevent: ${e.event}\ndata: ${JSON.stringify(e.payload)}\n\n`)};
+ const detach=subscribe(cid,after,write);
+ const heartbeat=setInterval(()=>{if(!res.destroyed&&!res.writableEnded)res.write(': heartbeat\n\n')},15000);
+ res.on('close',()=>{clearInterval(heartbeat);detach()});
+});
+app.post('/api/conversations/:id/queue/resume',auth,(req,res)=>{
+ if(!one('SELECT 1 FROM conversations WHERE id=?',req.params.id))return res.sendStatus(404);
+ res.json(resume(req.params.id));
+});
+app.delete('/api/conversations/:id/queue/:jobId',auth,(req,res)=>{
+ const result=cancel(req.params.id,req.params.jobId);
+ res.status(result.code||200).json(result.code?{error:result.error}:result);
+});
 // History edits are forbidden while a job is running, so its context snapshot
 // cannot diverge from what the user sees after completion.
 function editableConversation(req,res,next){
  const cid=req.params.id;
  if(!one('SELECT id FROM conversations WHERE id=?',cid))return res.status(404).json({error:'對話不存在'});
- if(active.has(cid))return res.status(409).json({error:'正在生成，請完成或停止後再修改歷史上下文'});
+ if(isActive(cid)||one("SELECT 1 FROM queue_jobs WHERE conversation_id=? AND state='queued'",cid))
+   return res.status(409).json({error:'目前仍有生成或待發送任務，請先完成或取消佇列再修改歷史上下文'});
  next();
 }
 app.patch('/api/conversations/:id/messages/:messageId',auth,editableConversation,(req,res)=>{
@@ -80,61 +118,32 @@ app.post('/api/conversations/:id/rewind',auth,editableConversation,(req,res)=>{
  }catch(err){db.exec('ROLLBACK');throw err}
  res.json({ok:true,rewound_text:messages[idx].content,removed_count:messages.length-idx});
 });
-app.patch('/api/conversations/:id',auth,(req,res)=>{const c=one(convoSql+' WHERE id=?',req.params.id);if(!c)return res.sendStatus(404);const pid=req.body.provider_id===undefined?c.provider_id:req.body.provider_id;const mid=req.body.model_id===undefined?c.model_id:req.body.model_id;if(pid&&mid&&!one('SELECT id FROM models WHERE provider_id=? AND model_id=? AND enabled=1',pid,mid))return res.status(400).json({error:'模型未啟用'});run('UPDATE conversations SET title=?,system_prompt=?,provider_id=?,model_id=?,updated_at=? WHERE id=?',String(req.body.title??c.title).slice(0,120),String(req.body.system_prompt??c.system_prompt),pid,mid,utcNow(),c.id);res.json(one(convoSql+' WHERE id=?',c.id))});
-app.delete('/api/conversations/:id',auth,(req,res)=>{active.get(req.params.id)?.controller.abort('deleted');run('DELETE FROM conversations WHERE id=?',req.params.id);res.json({ok:true})});
+app.patch('/api/conversations/:id',auth,(req,res)=>{
+ const c=one(convoSql+' WHERE id=?',req.params.id);if(!c)return res.sendStatus(404);
+ const pid=req.body.provider_id===undefined?c.provider_id:req.body.provider_id;
+ const mid=req.body.model_id===undefined?c.model_id:req.body.model_id;
+ if(pid&&mid&&!one('SELECT id FROM models WHERE provider_id=? AND model_id=? AND enabled=1',pid,mid))return res.status(400).json({error:'模型未啟用'});
+ const customized=Object.hasOwn(req.body,'title')?1:c.title_customized;
+ run('UPDATE conversations SET title=?,title_customized=?,system_prompt=?,provider_id=?,model_id=?,updated_at=? WHERE id=?',
+   String(req.body.title??c.title).slice(0,120),customized,String(req.body.system_prompt??c.system_prompt),pid,mid,utcNow(),c.id);
+ res.json(one(convoSql+' WHERE id=?',c.id));
+});
+app.delete('/api/conversations/:id',auth,(req,res)=>{stop(req.params.id);run('DELETE FROM conversations WHERE id=?',req.params.id);res.json({ok:true})});
 app.get('/api/stats',auth,(req,res)=>res.json({requests:one("SELECT COUNT(*) AS count, SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) AS completed FROM requests"),usage:one('SELECT SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,SUM(total_tokens) AS total_tokens,SUM(cache_read_tokens) AS cache_read_tokens,SUM(cache_creation_tokens) AS cache_creation_tokens,SUM(reasoning_tokens) AS reasoning_tokens FROM requests'),by_model:query('SELECT provider_name,model_id,COUNT(*) AS calls,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens FROM requests GROUP BY provider_name,model_id ORDER BY calls DESC'),recent:query('SELECT * FROM requests ORDER BY started_at DESC LIMIT 30')}));
 app.get('/api/export',auth,(req,res)=>{const type=req.query.type==='settings'?'settings':'chats';const data=type==='chats'?{conversations:query('SELECT * FROM conversations'),messages:query('SELECT * FROM messages'),requests:query('SELECT * FROM requests')}:{providers:query('SELECT id,name,protocol,endpoint,created_at FROM providers'),models:query('SELECT * FROM models'),settings:query('SELECT * FROM settings')};res.setHeader('Content-Disposition',`attachment; filename="aistation-${type}.json"`);res.type('json').send(JSON.stringify({exported_at:utcNow(),type,...data},null,2))});
-app.post('/api/conversations/:id/stop',auth,(req,res)=>{const a=active.get(req.params.id);if(a){a.stopped=true;a.controller.abort('stopped')}res.json({ok:true,stopping:!!a})});
-app.post('/api/conversations/:id/send',auth,async(req,res)=>{
- const cid=req.params.id, convo=one(convoSql+' WHERE id=?',cid);
- if(!convo)return res.status(404).json({error:'對話不存在'});
- if(active.has(cid))return res.status(409).json({error:'此對話正進行生成'});
- const content=String(req.body.content||'').trim();if(!content||content.length>100000)return res.status(400).json({error:'訊息不可空白或過長'});
- const p=one('SELECT * FROM providers WHERE id=?',convo.provider_id);
- if(!p||!convo.model_id||!one('SELECT id FROM models WHERE provider_id=? AND model_id=? AND enabled=1',p.id,convo.model_id))return res.status(400).json({error:'請先選擇有效模型'});
- let thinking;
- try {thinking=resolveThinking(p.protocol,convo.model_id,req.body.thinking)}
- catch(e){return res.status(400).json({error:e.message})}
- const controller=new AbortController();const state={controller,stopped:false};active.set(cid,state);
- const started=utcNow(),uid=id(),aid=id(),rid=id();
- state.request_id=rid;state.started_at=started;
- run("INSERT INTO messages(id,conversation_id,role,content) VALUES(?,?,'user',?)",uid,cid,content);
- run("INSERT INTO messages(id,conversation_id,role,content,status) VALUES(?,?,'assistant','','running')",aid,cid);
- run('INSERT INTO requests(id,conversation_id,assistant_message_id,provider_id,provider_name,model_id,started_at,thinking_mode,thinking_effort,thinking_budget_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)',rid,cid,aid,p.id,p.name,convo.model_id,started,thinking.mode,thinking.effort,thinking.budget_tokens);
- run('UPDATE conversations SET updated_at=? WHERE id=?',utcNow(),cid);
- const messages=query("SELECT role,content FROM messages WHERE conversation_id=? AND id!=? AND status IN ('complete','stopped') ORDER BY created_at,rowid",cid,aid);
- res.status(200).set({'Content-Type':'text/event-stream; charset=utf-8','Connection':'keep-alive','X-Accel-Buffering':'no','Cache-Control':'no-cache, no-transform'});res.flushHeaders();
- // A browser disconnect only detaches this SSE response. Upstream generation
- // and SQLite persistence continue in this Node.js process.
- const send=(event,data)=>{if(!res.destroyed&&!res.writableEnded)res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)};
- send('started',{request_id:rid,user_id:uid,assistant_id:aid,started_at:started,thinking:{mode:thinking.mode,effort:thinking.effort,budget_tokens:thinking.budget_tokens}});
- let accumulated='',thinkingContent='',usage={},finishReason=null,lastCheckpoint=0;
- const checkpoint=()=>{if(Date.now()-lastCheckpoint<750)return;lastCheckpoint=Date.now();
-   run('UPDATE messages SET content=?,thinking_content=? WHERE id=?',accumulated,thinkingContent,aid);
- };
- let idle;
- const reset=()=>{clearTimeout(idle);idle=setTimeout(()=>controller.abort('idle_timeout'),Math.max(10000,Number(process.env.UPSTREAM_IDLE_TIMEOUT_MS)||90000))};
- const max=setTimeout(()=>controller.abort('max_timeout'),Math.max(30000,Number(process.env.UPSTREAM_MAX_TIMEOUT_MS)||600000));
- const onUsage=(u,r)=>{usage=u;finishReason=r;};
- try{
- reset();
- await streamProvider({provider:p,model:convo.model_id,system:convo.system_prompt,messages,thinking,signal:controller.signal,
-   onActivity:reset,
-   onDelta:delta=>{accumulated+=delta;checkpoint();send('delta',{text:delta})},
-   onThinking:delta=>{thinkingContent+=delta;checkpoint();send('thinking_delta',{text:delta})},
-   onUsage,onFinished:(u,r)=>{usage=u;finishReason=r}});
- const n=normalizedUsage(p.protocol,usage);
- run('UPDATE messages SET content=?,thinking_content=?,status=? WHERE id=?',accumulated,thinkingContent,'complete',aid);
- run('UPDATE requests SET status=?,input_tokens=?,output_tokens=?,total_tokens=?,cache_read_tokens=?,cache_creation_tokens=?,reasoning_tokens=?,usage_raw=?,finish_reason=?,finished_at=? WHERE id=?','complete',n.input_tokens,n.output_tokens,n.total_tokens,n.cache_read_tokens,n.cache_creation_tokens,n.reasoning_tokens,JSON.stringify(usage),finishReason,utcNow(),rid);
- send('complete',{request_id:rid,usage:n,finish_reason:finishReason});
- }catch(e){
- const status=state.stopped?'stopped':controller.signal.aborted?'error':'error';const n=normalizedUsage(p.protocol,usage);
- const raw=redact(e.raw||e.message||String(e),[]);const code=state.stopped?'USER_STOP':controller.signal.aborted?String(controller.signal.reason||'TIMEOUT'):(e.provider_code||'unknown');
- run('UPDATE messages SET content=?,thinking_content=?,status=? WHERE id=?',accumulated,thinkingContent,status,aid);
- run('UPDATE requests SET status=?,input_tokens=?,output_tokens=?,total_tokens=?,cache_read_tokens=?,cache_creation_tokens=?,reasoning_tokens=?,usage_raw=?,finish_reason=?,http_status=?,provider_error_code=?,error_body=?,finished_at=? WHERE id=?',status,n.input_tokens,n.output_tokens,n.total_tokens,n.cache_read_tokens,n.cache_creation_tokens,n.reasoning_tokens,JSON.stringify(usage),finishReason,e.status||null,code,status==='stopped'?null:raw,utcNow(),rid);
- send(status==='stopped'?'stopped':'error',{request_id:rid,http_status:e.status||null,provider_code:code,error:status==='stopped'?'已停止生成':raw,started_at:started,partial:accumulated});
- }finally{clearTimeout(idle);clearTimeout(max);active.delete(cid);res.end();}
+app.post('/api/conversations/:id/stop',auth,(req,res)=>res.json(stop(req.params.id)));
+app.post('/api/conversations/:id/send',auth,(req,res)=>{
+ const key=req.get('Idempotency-Key')||req.body?.idempotency_key;
+ const outcome=enqueue({cid:req.params.id,requestId:key,content:req.body?.content,thinking:req.body?.thinking});
+ if(outcome.error)return res.status(outcome.code).json({error:outcome.error});
+ const job=outcome.job;
+ // The POST only enqueues. Reconnectable SSE is a separate authenticated GET.
+ res.status(outcome.deduplicated?200:202).json({
+   request_id:job.id,state:job.state,deduplicated:outcome.deduplicated,
+   events_url:'/api/conversations/'+encodeURIComponent(req.params.id)+'/events'
+ });
 });
+recoverQueue();
 app.use(express.static(path.resolve('dist'),{index:false}));
 app.get('/{*any}',(req,res)=>{const p=path.resolve('dist/index.html');if(fs.existsSync(p))res.sendFile(p);else res.status(503).send('Frontend is not built. Run npm run build.');});
 const port=Number(process.env.PORT||3000);app.listen(port,process.env.HOST||'0.0.0.0',()=>console.log(`AI Station listening on ${process.env.HOST||'0.0.0.0'}:${port}`));

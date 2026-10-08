@@ -2,8 +2,8 @@ import './style.css';
 import {SSEParser} from './sse.js';
 import {marked} from 'marked';import DOMPurify from 'dompurify';import hljs from 'highlight.js';import katex from 'katex';import 'katex/dist/katex.min.css';import 'highlight.js/styles/github-dark.css';
 const root=document.querySelector('#app');
-const state={me:null,tab:'chat',providers:[],models:[],conversations:[],selected:null,detail:null,stats:null,settings:null,busy:new Set(),remoteRunning:new Set(),queues:new Map(),errors:new Map(),paused:new Set(),thinkingSelections:new Map(),thinkingExpanded:new Map(),editingMessage:null};
-const isGenerating=cid=>state.busy.has(cid)||state.remoteRunning.has(cid);
+const state={me:null,tab:'chat',providers:[],models:[],conversations:[],selected:null,detail:null,stats:null,settings:null,busy:new Set(),remoteRunning:new Set(),queues:new Map(),errors:new Map(),paused:new Set(),thinkingSelections:new Map(),thinkingExpanded:new Map(),editingMessage:null,liveJobs:new Map(),liveAssistantIds:new Map()};
+const isGenerating=cid=>state.busy.has(cid)||state.remoteRunning.has(cid)||(state.selected===cid&&!!state.detail?.queue?.jobs?.length);
 let generationPoll=null,pollBusy=false;
 const $=(s,scope=document)=>scope.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -18,7 +18,7 @@ function renderMarkdown(raw){
  return DOMPurify.sanitize(html,{ADD_ATTR:['class']}).replace(/MATHPLACEHOLDER(\d+)END/g,(_,i)=>math[Number(i)]||'');
 }
 function shell(){root.innerHTML=`<header class="top"><div class="brand"><span class="spark">✳</span> AI Station <span class="brand-sub">PRIVATE WORKSPACE</span></div><nav><button data-tab="chat" class="${state.tab==='chat'?'on':''}">聊天工作區</button><button data-tab="admin" class="${state.tab==='admin'?'on':''}">管理中心</button></nav><button class="subtle" id="logout">登出 ↗</button></header><main id="main"></main>`;
- $$('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;render()});$('#logout').onclick=async()=>{await api('/logout','POST');clearInterval(generationPoll);generationPoll=null;state.me=null;state.remoteRunning.clear();login()};}
+ $$('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;render()});$('#logout').onclick=async()=>{await api('/logout','POST');clearInterval(generationPoll);generationPoll=null;liveFeed?.close();liveConversationId=null;state.me=null;state.remoteRunning.clear();login()};}
 const $$=(s,scope=document)=>[...scope.querySelectorAll(s)];
 function login(){root.innerHTML=`<div class="login-layout"><div class="login-intro"><div class="eyebrow">PRIVATE AI WORKSPACE</div><div class="spark hero-mark">✳</div><h1>讓每個想法，<br>都有個好去處。</h1><p>一個私人的 AI 對話與模型管理空間。<br>安全整理你的對話、模型與使用紀錄。</p><div class="dark-note">DESIGNED FOR FOCUSED THINKING　↗</div></div><form class="login-card" id="login"><span class="eyebrow">WELCOME BACK</span><h2>歡迎回來。</h2><p class="muted">登入以繼續你的工作。</p><label>管理員帳號<input name="username" autocomplete="username" required autofocus></label><label>管理員密碼<input name="password" type="password" autocomplete="current-password" required></label><p class="form-error" id="loginError"></p><button class="primary" type="submit">登入工作空間　↗</button><p class="small-muted">單一管理員 · 不開放公開註冊</p></form></div>`;
  $('#login').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);try{await api('/login','POST',Object.fromEntries(f));await load();render()}catch(err){$('#loginError').textContent=err.message}}}
@@ -43,7 +43,7 @@ async function syncGenerations(){
    const finished=[...previous].filter(cid=>!state.remoteRunning.has(cid));
    for(const cid of finished){
      if(state.selected===cid){await refreshDetail(cid);await loadConvos();if(state.tab==='chat')renderQueue()}
-     if(!state.busy.has(cid))drain(cid);
+     // The server owns FIFO; do not resend from this browser.
    }
    if(state.selected&&state.tab==='chat')renderQueue();
  }finally{pollBusy=false}
@@ -137,7 +137,7 @@ function bindMessageActions(container, conversation){
      if(!confirm('確定回退？此則使用者訊息與其後所有訊息將刪除，並放回輸入框重新編輯。尚未送出的排隊訊息也會清空。'))return;
      try{
        const result=await api('/conversations/'+conversation.id+'/rewind','POST',{message_id:m.id});
-       state.queues.set(conversation.id,[]);
+       // Server-side queued jobs must be cancelled before history can be rewound.
        state.paused.delete(conversation.id);
        state.editingMessage=null;
        await refreshDetail(conversation.id);
@@ -183,58 +183,117 @@ function scheduleMessageRender(){
 async function openConvo(cid){state.selected=cid;state.editingMessage=null;state.detail=await api('/conversations/'+cid);try{localStorage.setItem('ai-station-last-conversation',cid)}catch{}render();}
 async function makeConvo(){const m=usable()[0];const c=await api('/conversations','POST',{provider_id:m?.provider_id||null,model_id:m?.model_id||null});await loadConvos();await openConvo(c.id)}
 async function patchConvo(patch){state.detail=await api('/conversations/'+state.selected,'PATCH',patch).then(async()=>api('/conversations/'+state.selected));await loadConvos();render()}
-function renderQueue(){const q=state.queues.get(state.selected)||[];const el=$('#queue');if(!el)return;el.innerHTML=(state.paused.has(state.selected)?'<div class="queued"><span>佇列已因 API 錯誤暫停</span><button id="resumeQueue" class="secondary">繼續傳送</button></div>':'')+q.map((item,i)=>`<div class="queued"><span>預約 ${i+1} · 思考：${esc(describeThinking(item.thinking))} · ${esc(item.content.slice(0,100))}</span><button data-cancel="${item.id}" class="subtle">取消</button></div>`).join('');$$('[data-cancel]',el).forEach(b=>b.onclick=()=>{state.queues.set(state.selected,(state.queues.get(state.selected)||[]).filter(x=>x.id!==b.dataset.cancel));renderQueue()});if($('#resumeQueue'))$('#resumeQueue').onclick=()=>{const cid=state.selected;state.paused.delete(cid);renderQueue();drain(cid)};const stop=$('#stop');if(stop)stop.hidden=!isGenerating(state.selected);}
-function queueMessage(){const c=state.detail;if(!c)return;const input=$('#compose'),content=input.value.trim();if(!content)return;if(!c.model_id){alert('請先設定模型');return}const thinking=readThinkingUI();if(thinking.mode==='budget'&&(!Number.isSafeInteger(thinking.budget_tokens)||thinking.budget_tokens<1024||thinking.budget_tokens>32768)){alert('Claude 思考 Token 必須是 1,024 至 32,768 的整數');return}input.value='';const q=state.queues.get(c.id)||[];q.push({id:Date.now().toString(36)+'-'+Math.random().toString(36).slice(2),content,thinking});state.queues.set(c.id,q);renderQueue();drain(c.id);}
-async function drain(cid){if(isGenerating(cid)||state.paused.has(cid))return;const q=state.queues.get(cid)||[];if(!q.length)return;state.busy.add(cid);if(state.selected===cid)renderQueue();const item=q.shift();if(state.selected===cid)renderQueue();let terminal=false,failed=false,detached=false;
- try{
- const r=await fetch('/api/conversations/'+cid+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:item.content,thinking:item.thinking})});
- if(!r.ok){let j=await r.json();throw Error(j.error||r.statusText)}
- if(!r.body)throw Error('伺服器未提供 SSE 串流');
- const reader=r.body.getReader();
- let assistantId=null;
- const parser=new SSEParser(({event,data:raw})=>{
-   let data;try{data=JSON.parse(raw)}catch{return}
-   if(['complete','stopped','error'].includes(event)){
-     terminal=true;failed=event==='error';
-     if(failed)state.errors.set(cid,data.error);
-   }
-   if(state.selected!==cid||!state.detail)return;
-   if(event==='started'){
-     assistantId=data.assistant_id;
-     state.detail.messages.push({id:data.user_id,role:'user',content:item.content,thinking_content:'',status:'complete'});
-     state.detail.messages.push({id:assistantId,role:'assistant',content:'',thinking_content:'',status:'running',live:true});
-     renderMessages();
-   }else if(event==='delta'||event==='thinking_delta'){
-     const m=state.detail.messages.find(x=>x.id===assistantId);
-     if(m){
-       if(event==='delta')m.content+=data.text||'';
-       else m.thinking_content+=data.text||'';
-       scheduleMessageRender();
-     }
-   }
- });
- while(true){
-   const {done,value}=await reader.read();
-   if(done)break;
-   parser.feed(value);
- }
- parser.end();
- if(!terminal)throw Error('串流中斷，可能仍在伺服器背景生成');
- }catch(e){
-   if(String(e.message).includes('串流中斷，可能仍在伺服器背景生成')){
-     detached=true;state.remoteRunning.add(cid);
-   }else{failed=true;state.errors.set(cid,e.message);if(state.selected===cid)alert('請求失敗，佇列已暫停：'+e.message)}
- }finally{
-   state.busy.delete(cid);
-   if(terminal)state.remoteRunning.delete(cid);
-   if(failed)state.paused.add(cid);
-   if(state.selected===cid){await refreshDetail(cid).catch(()=>{});renderQueue()}
-   if(detached)syncGenerations().catch(()=>{});
-   else if(!failed)drain(cid);
+let liveFeed=null,liveConversationId=null,refreshScheduled=null;
+function newRequestId(){const a=new Uint8Array(16);crypto.getRandomValues(a);a[6]=(a[6]&15)|64;a[8]=(a[8]&63)|128;const hex=[...a].map(x=>x.toString(16).padStart(2,'0')).join('');return [hex.slice(0,8),hex.slice(8,12),hex.slice(12,16),hex.slice(16,20),hex.slice(20)].join('-')}
+
+function subscribeConversation(cid,cursor){
+ liveFeed?.close();liveConversationId=cid;
+ if(refreshScheduled){clearTimeout(refreshScheduled);refreshScheduled=null}
+ const feed=new EventSource('/api/conversations/'+encodeURIComponent(cid)+'/events?after='+encodeURIComponent(cursor||0));
+ liveFeed=feed;
+ const refreshSoon=()=>{if(refreshScheduled)return;refreshScheduled=setTimeout(async()=>{
+   refreshScheduled=null;
+   if(state.selected===cid)await refreshDetail(cid).catch(()=>{});
+   await loadConvos().catch(()=>{});
+   if(state.selected===cid&&state.tab==='chat')renderQueue();
+ },300)};
+ for(const type of ['queued','started','delta','thinking_delta','complete','error','stopped','cancelled','resumed','title']){
+  feed.addEventListener(type,e=>{
+    if(state.selected!==cid)return;
+    let data={};try{data=JSON.parse(e.data)}catch{}
+    if(type==='error')state.paused.add(cid);
+    if(type==='resumed')state.paused.delete(cid);
+    if(type==='started'&&state.liveJobs.get(cid)?.has(data.request_id)){
+      if(!state.liveAssistantIds.has(cid))state.liveAssistantIds.set(cid,new Set());
+      state.liveAssistantIds.get(cid).add(data.assistant_id);
+    }
+    if(['complete','stopped','error'].includes(type)&&state.liveJobs.get(cid)?.has(data.request_id)){
+      state.liveJobs.get(cid).delete(data.request_id);
+      if(!state.liveJobs.get(cid).size){
+        state.liveJobs.delete(cid);
+        state.liveAssistantIds.delete(cid);
+      }
+    }
+    if(type==='title'&&data.title){const c=state.conversations.find(x=>x.id===cid);if(c)c.title=data.title;const h=$('.chat-top h2');if(h)h.textContent=data.title}
+    if(type==='delta'||type==='thinking_delta'){
+      const m=state.detail?.messages?.find(x=>x.id===data.assistant_id);
+      if(m&&m.status==='running'&&m.live){
+        if(type==='delta')m.content+=data.text||'';
+        else m.thinking_content+=data.text||'';
+        scheduleMessageRender();
+      }else if(state.liveAssistantIds.get(cid)?.has(data.assistant_id)&&state.detail){
+        state.detail.messages.push({id:data.assistant_id,role:'assistant',status:'running',content:type==='delta'?(data.text||''):'',thinking_content:type==='thinking_delta'?(data.text||''):'',live:true});
+        scheduleMessageRender();
+      }else refreshSoon();
+    }else refreshSoon();
+  });
  }
 }
-async function refreshDetail(cid){if(state.selected!==cid)return;state.detail=await api('/conversations/'+cid);renderMessages();}
-function adminPage(){const s=state.stats||{requests:{count:0},usage:{},recent:[]};$('#main').innerHTML=`<div class="admin"><div class="admin-header"><div><div class="eyebrow">SETTINGS & INSIGHTS</div><h1>管理中心.</h1><p class="section-note">模型設定、供應商與實際 API 用量。</p></div><button class="secondary" id="exportChats">匯出對話 JSON</button></div><div class="admin-grid">${[['TOTAL REQUESTS',s.requests.count],['INPUT TOKENS',s.usage.input_tokens],['OUTPUT TOKENS',s.usage.output_tokens]].map(([k,v])=>`<div class="metric"><span class="eyebrow">${k}</span><strong>${fmt(v)}</strong></div>`).join('')}</div><section class="panel"><h2>API Endpoints</h2><p class="section-note">完整 URL：OpenAI 使用 /chat/completions；Claude 使用 /messages。</p><form id="providerForm" class="form-grid"><input type="hidden" name="id"><label>名稱<input name="name" required></label><label>協定<select name="protocol"><option value="openai">OpenAI 相容</option><option value="claude">Claude 相容</option></select></label><label class="wide">完整 Endpoint<input type="url" name="endpoint" required></label><label class="wide">API Key（留空保留舊金鑰）<input type="password" autocomplete="off" name="api_key"></label><div class="wide actions"><button class="primary">儲存 Endpoint</button><button type="reset" class="secondary">清除</button></div></form><table class="data-table"><thead><tr><th>名稱</th><th>路徑</th><th>操作</th></tr></thead><tbody>${state.providers.map(p=>`<tr><td>${esc(p.name)}<div class="muted">${esc(p.protocol)} · Key 已遮蔽</div></td><td class="truncate">${esc(p.endpoint)}</td><td class="actions"><button class="secondary" data-ptest="${p.id}">測試</button><button class="secondary" data-pscan="${p.id}">偵測</button><button class="subtle" data-pedit="${p.id}">編輯</button><button class="subtle danger" data-pdel="${p.id}">刪除</button></td></tr>`).join('')}</tbody></table></section><section class="panel"><h2>模型列表</h2><form id="modelForm" class="form-grid"><label>Endpoint<select name="provider_id">${state.providers.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><label>Model ID<input name="model_id" required></label><div class="wide"><button class="primary">手動新增模型</button></div></form><table class="data-table"><thead><tr><th>Endpoint</th><th>Model ID</th><th>來源</th><th>操作</th></tr></thead><tbody>${state.models.map(m=>`<tr><td>${esc(m.provider_name)}</td><td>${esc(m.model_id)}</td><td>${esc(m.source)}</td><td><button data-mtoggle="${m.id}" class="secondary">${m.enabled?'停用':'啟用'}</button><button data-mdel="${m.id}" class="subtle danger">刪除</button></td></tr>`).join('')}</tbody></table></section><section class="panel panel-dark"><h2>預設 System Prompt</h2><textarea id="defaultSystem" rows="3">${esc(state.settings?.default_system_prompt)}</textarea><div class="actions" style="margin-top:16px"><button class="primary" id="saveDefault">儲存預設</button><button class="secondary" id="exportSettings">匯出設定（不含 Key）</button></div></section><section class="panel"><h2>用量與錯誤紀錄</h2><div class="admin-grid">${[['快取讀取',s.usage.cache_read_tokens],['快取建立',s.usage.cache_creation_tokens],['推理 Token',s.usage.reasoning_tokens]].map(([k,v])=>`<div class="metric"><span class="eyebrow">${k}</span><strong>${fmt(v)}</strong></div>`).join('')}</div><table class="data-table"><tr><th>時間</th><th>供應商 / 模型</th><th>狀態</th><th>輸入</th><th>輸出</th><th>錯誤</th></tr>${s.recent.map(r=>`<tr><td>${esc(r.started_at)}</td><td>${esc(r.provider_name)} / ${esc(r.model_id)}</td><td>${esc(r.status)}</td><td>${fmt(r.input_tokens)}</td><td>${fmt(r.output_tokens)}</td><td>${r.error_body?`<details><summary>查看</summary><pre>${esc(r.http_status)} · ${esc(r.provider_error_code)}\n${esc(r.error_body)}</pre></details>`:'—'}</td></tr>`).join('')}</table></section></div>`;
+function renderQueue(){
+ const cid=state.selected,el=$('#queue');
+ if(!el)return;
+ const q=state.detail?.queue;
+ if(!q)return;
+ state.remoteRunning.delete(cid);
+ for(const job of q.jobs||[])if(job.state==='running')state.remoteRunning.add(cid);
+ const queued=q.jobs||[];
+ el.innerHTML=(q.paused?'<div class="queued"><span>佇列已因 API 錯誤或重啟暫停</span><button id="resumeQueue" class="secondary">繼續傳送</button></div>':'')+
+  queued.map((job,i)=>`<div class="queued"><span>${job.state==='running'?'生成中':'排隊 '+(i+1)} · ${esc(job.content.slice(0,100))}</span>${job.state==='queued'?`<button data-cancel="${esc(job.id)}" class="subtle">取消</button>`:''}</div>`).join('');
+ $$('[data-cancel]',el).forEach(b=>b.onclick=async()=>{
+  try{await api('/conversations/'+cid+'/queue/'+encodeURIComponent(b.dataset.cancel),'DELETE');await refreshDetail(cid);renderQueue()}
+  catch(e){alert(e.message)}
+ });
+ if($('#resumeQueue'))$('#resumeQueue').onclick=async()=>{
+  try{await api('/conversations/'+cid+'/queue/resume','POST');await refreshDetail(cid);renderQueue()}
+  catch(e){alert(e.message)}
+ };
+ const stopButton=$('#stop');if(stopButton)stopButton.hidden=!(q.jobs||[]).some(j=>j.state==='running');
+}
+async function queueMessage(){
+ const c=state.detail;
+ if(!c)return;
+ const input=$('#compose'),content=input?.value.trim();
+ if(!content)return;
+ if(!c.model_id){alert('請先設定模型');return}
+ const thinking=readThinkingUI();
+ if(thinking.mode==='budget'&&(!Number.isSafeInteger(thinking.budget_tokens)||thinking.budget_tokens<1024||thinking.budget_tokens>32768)){
+   alert('Claude 思考 Token 必須是 1,024 至 32,768 的整數');return;
+ }
+ const keyName='aistation-submission-'+c.id;
+ let saved=null;
+ try{saved=JSON.parse(localStorage.getItem(keyName)||'null')}catch{}
+ const same= saved&&saved.content===content&&JSON.stringify(saved.thinking)===JSON.stringify(thinking);
+ const payload={content,thinking,idempotency_key:same?saved.idempotency_key:newRequestId()};
+ try{localStorage.setItem(keyName,JSON.stringify(payload))}catch{}
+ if(!state.liveJobs.has(c.id))state.liveJobs.set(c.id,new Set());
+ state.liveJobs.get(c.id).add(payload.idempotency_key);
+ try{
+   await api('/conversations/'+c.id+'/send','POST',payload);
+   input.value='';
+   try{localStorage.removeItem(keyName)}catch{}
+   await refreshDetail(c.id);
+   renderQueue();
+ }catch(e){state.liveJobs.get(c.id)?.delete(payload.idempotency_key);alert('傳送失敗，訊息仍留在輸入框；重新按傳送會使用相同請求 ID 避免重複：'+e.message)}
+}
+async function refreshDetail(cid){
+ if(state.selected!==cid)return;
+ const previous=state.detail;
+ const updated=await api('/conversations/'+cid);
+ if(state.selected!==cid)return;
+ for(const liveId of state.liveAssistantIds.get(cid)||[]){
+   const newMessage=updated.messages.find(m=>m.id===liveId);
+   const oldMessage=previous?.messages?.find(m=>m.id===liveId);
+   if(newMessage&&newMessage.status==='running'){
+     newMessage.live=true;
+     if(oldMessage?.live){
+       if(oldMessage.content.length>newMessage.content.length)newMessage.content=oldMessage.content;
+       if(oldMessage.thinking_content.length>newMessage.thinking_content.length)newMessage.thinking_content=oldMessage.thinking_content;
+     }
+   }
+ }
+ state.detail=updated;renderMessages();renderQueue();
+}
+function adminPage(){const s=state.stats||{requests:{count:0},usage:{},recent:[]};$('#main').innerHTML=`<div class="admin"><div class="admin-header"><div><div class="eyebrow">SETTINGS & INSIGHTS</div><h1>管理中心.</h1><p class="section-note">模型設定、供應商與實際 API 用量。</p></div><button class="secondary" id="exportChats">匯出對話 JSON</button></div><div class="admin-grid">${[['TOTAL REQUESTS',s.requests.count],['INPUT TOKENS',s.usage.input_tokens],['OUTPUT TOKENS',s.usage.output_tokens]].map(([k,v])=>`<div class="metric"><span class="eyebrow">${k}</span><strong>${fmt(v)}</strong></div>`).join('')}</div><section class="panel"><h2>API Endpoints</h2><p class="section-note">完整 URL：OpenAI 使用 /chat/completions；Claude 使用 /messages。</p><form id="providerForm" class="form-grid"><input type="hidden" name="id"><label>名稱<input name="name" required></label><label>協定<select name="protocol"><option value="openai">OpenAI 相容</option><option value="claude">Claude 相容</option></select></label><label class="wide">完整 Endpoint<input type="url" name="endpoint" required></label><label class="wide">API Key（留空保留舊金鑰）<input type="password" autocomplete="off" name="api_key"></label><div class="wide actions"><button class="primary">儲存 Endpoint</button><button type="reset" class="secondary">清除</button></div></form><table class="data-table"><thead><tr><th>名稱</th><th>路徑</th><th>操作</th></tr></thead><tbody>${state.providers.map(p=>`<tr><td>${esc(p.name)}<div class="muted">${esc(p.protocol)} · Key 已遮蔽</div></td><td class="truncate">${esc(p.endpoint)}</td><td class="actions"><button class="secondary" data-ptest="${p.id}">測試</button><button class="secondary" data-pscan="${p.id}">偵測</button><button class="subtle" data-pedit="${p.id}">編輯</button><button class="subtle danger" data-pdel="${p.id}">刪除</button></td></tr>`).join('')}</tbody></table></section><section class="panel"><h2>模型列表</h2><form id="modelForm" class="form-grid"><label>Endpoint<select name="provider_id">${state.providers.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><label>Model ID<input name="model_id" required></label><div class="wide"><button class="primary">手動新增模型</button></div></form><table class="data-table"><thead><tr><th>Endpoint</th><th>Model ID</th><th>來源</th><th>操作</th></tr></thead><tbody>${state.models.map(m=>`<tr><td>${esc(m.provider_name)}</td><td>${esc(m.model_id)}</td><td>${esc(m.source)}</td><td><button data-mtoggle="${m.id}" class="secondary">${m.enabled?'停用':'啟用'}</button><button data-mdel="${m.id}" class="subtle danger">刪除</button></td></tr>`).join('')}</tbody></table></section><section class="panel"><h2>新對話自動命名</h2><p class="section-note">第一輪 AI 完整回覆成功後，會將該輪對話內容傳送給指定的命名模型並產生簡短標題；可選不同供應商模型。手動重新命名不會被覆蓋。命名請求會計入 Token 統計。</p><div class="form-grid"><label>命名模型<select id="namingModelSelect"><option value="">停用自動命名</option>${usable().map(m=>`<option value="${esc(m.id)}" ${m.id===state.settings?.naming_model_id?'selected':''}>${esc(m.provider_name)} / ${esc(m.model_id)}</option>`).join('')}</select></label><div class="actions" style="align-items:end"><button type="button" class="primary" id="saveNaming">儲存命名設定</button></div></div></section><section class="panel panel-dark"><h2>預設 System Prompt</h2><textarea id="defaultSystem" rows="3">${esc(state.settings?.default_system_prompt)}</textarea><div class="actions" style="margin-top:16px"><button class="primary" id="saveDefault">儲存預設</button><button class="secondary" id="exportSettings">匯出設定（不含 Key）</button></div></section><section class="panel"><h2>用量與錯誤紀錄</h2><div class="admin-grid">${[['快取讀取',s.usage.cache_read_tokens],['快取建立',s.usage.cache_creation_tokens],['推理 Token',s.usage.reasoning_tokens]].map(([k,v])=>`<div class="metric"><span class="eyebrow">${k}</span><strong>${fmt(v)}</strong></div>`).join('')}</div><table class="data-table"><tr><th>時間</th><th>供應商 / 模型</th><th>狀態</th><th>輸入</th><th>輸出</th><th>錯誤</th></tr>${s.recent.map(r=>`<tr><td>${esc(r.started_at)}</td><td>${esc(r.provider_name)} / ${esc(r.model_id)}</td><td>${esc(r.status)}</td><td>${fmt(r.input_tokens)}</td><td>${fmt(r.output_tokens)}</td><td>${r.error_body?`<details><summary>查看</summary><pre>${esc(r.http_status)} · ${esc(r.provider_error_code)}\n${esc(r.error_body)}</pre></details>`:'—'}</td></tr>`).join('')}</table></section></div>`;
  $('#providerForm').onsubmit=async e=>{e.preventDefault();const f=Object.fromEntries(new FormData(e.target));try{await api(f.id?'/providers/'+f.id:'/providers',f.id?'PATCH':'POST',f);await loadProviders();await loadModels();await adminRefresh()}catch(err){alert(err.message)}};
  $$('[data-pedit]').forEach(b=>b.onclick=()=>{const p=state.providers.find(x=>x.id===b.dataset.pedit),f=$('#providerForm').elements;for(const k of ['id','name','protocol','endpoint'])f[k].value=p[k];f.api_key.value='';f.name.focus()});
  $$('[data-ptest]').forEach(b=>b.onclick=async()=>{try{const r=await api('/providers/'+b.dataset.ptest+'/test','POST');alert('連線成功 · '+r.models_found+' 個模型')}catch(e){alert(e.message)}});
@@ -243,10 +302,11 @@ function adminPage(){const s=state.stats||{requests:{count:0},usage:{},recent:[]
  $('#modelForm').onsubmit=async e=>{e.preventDefault();try{await api('/models','POST',Object.fromEntries(new FormData(e.target)));await loadModels();await adminRefresh()}catch(e){alert(e.message)}};
  $$('[data-mtoggle]').forEach(b=>b.onclick=async()=>{const m=state.models.find(x=>x.id===b.dataset.mtoggle);await api('/models/'+m.id,'PATCH',{enabled:!m.enabled});await loadModels();adminPage()});
  $$('[data-mdel]').forEach(b=>b.onclick=async()=>{if(confirm('刪除模型？')){await api('/models/'+b.dataset.mdel,'DELETE');await loadModels();adminPage()}});
+ $('#saveNaming').onclick=async()=>{try{await api('/settings','PATCH',{naming_model_id:$('#namingModelSelect').value});state.settings=await api('/settings');alert('已儲存自動命名模型')}catch(e){alert(e.message)}};
  $('#saveDefault').onclick=async()=>{await api('/settings','PATCH',{default_system_prompt:$('#defaultSystem').value});alert('已儲存')};
  $('#exportChats').onclick=()=>location.href='/api/export?type=chats';$('#exportSettings').onclick=()=>location.href='/api/export?type=settings';
 }
 async function adminRefresh(){state.stats=await api('/stats');render()}
-function render(){shell();if(state.tab==='chat')chatPage();else {adminPage();adminRefreshOnce()}}
+function render(){shell();if(state.tab==='chat'){chatPage();if(state.detail&&state.selected!==liveConversationId)subscribeConversation(state.selected,state.detail.event_cursor)}else{liveFeed?.close();liveConversationId=null;adminPage();adminRefreshOnce()}}
 async function adminRefreshOnce(){if(!state.stats){state.stats=await api('/stats');adminPage()}}
 (async()=>{try{await load();render()}catch{login()}})();
