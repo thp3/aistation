@@ -8,6 +8,23 @@ import {autoNameFirstTurn} from './naming.js';
 const active=new Map();
 const bus=new EventEmitter();
 bus.setMaxListeners(200);
+const deltas=new Map();
+const statusBus=new EventEmitter();statusBus.setMaxListeners(200);
+export const liveMessage=cid=>active.get(cid)?.message;
+export function statusSnapshot(cid){
+ const conversation=cid?one('SELECT id,title,provider_id,model_id,created_at,updated_at FROM conversations WHERE id=?',cid):null;
+ return {active:running(),...(cid?{conversation_id:cid,conversation,queue:queueState(cid)}:{})};
+}
+export function subscribeStatus(listener){statusBus.on('status',listener);return ()=>statusBus.off('status',listener)}
+function publishStatus(cid,changed,requestId){statusBus.emit('status',{event:'status',payload:{...statusSnapshot(cid),changed,request_id:requestId}})}
+export function flushDeltas(cid){
+ for(const [key,item] of deltas){if(cid&&item.cid!==cid)continue;clearTimeout(item.timer);deltas.delete(key);persistEvent(item.cid,item.job,item.event,item.payload)}
+}
+function persistEvent(cid,job,event,payload){
+ if(!one('SELECT 1 FROM conversations WHERE id=?',cid))return;
+ const record=run('INSERT INTO queue_events(conversation_id,job_id,event,payload) VALUES(?,?,?,?)',cid,job,event,JSON.stringify(payload));
+ const seq=Number(record.lastInsertRowid);bus.emit(cid,{seq,event,payload});
+}
 const fingerprint=({conversation_id,content,thinking})=>crypto.createHash('sha256')
   .update(JSON.stringify([conversation_id,content,thinking])).digest('hex');
 export const isActive=cid=>active.has(cid);
@@ -18,15 +35,29 @@ export const isPaused=cid=>!!one('SELECT 1 FROM queue_pauses WHERE conversation_
 
 export function emit(cid,job,event,payload={}){
  if(!one('SELECT 1 FROM conversations WHERE id=?',cid))return;
- const record=run('INSERT INTO queue_events(conversation_id,job_id,event,payload) VALUES(?,?,?,?)',cid,job,event,JSON.stringify(payload));
- const seq=Number(record.lastInsertRowid);
- bus.emit(cid,{seq,event,payload});
+ if(event==='delta'||event==='thinking_delta'){
+  const key=JSON.stringify([cid,job,event]);let item=deltas.get(key);
+  if(item){item.payload.text+=payload.text||'';item.bytes+=Buffer.byteLength(payload.text||'')}
+  else{item={cid,job,event,payload:{...payload},bytes:Buffer.byteLength(payload.text||'')};item.timer=setTimeout(()=>{deltas.delete(key);persistEvent(cid,job,event,item.payload)},40);deltas.set(key,item)}
+  if(item.bytes>=16384){clearTimeout(item.timer);deltas.delete(key);persistEvent(cid,job,event,item.payload)}
+  return;
+ }
+ flushDeltas(cid);
+ payload={...payload,queue:queueState(cid),conversation:one('SELECT id,title,provider_id,model_id,created_at,updated_at FROM conversations WHERE id=?',cid)};
+ if(['complete','error','stopped'].includes(event)){
+  const request=one("SELECT id,assistant_message_id,status,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_creation_tokens,reasoning_tokens,finish_reason,http_status,provider_error_code,error_body,started_at,finished_at,thinking_mode,thinking_effort,thinking_budget_tokens FROM requests WHERE conversation_id=? AND kind='chat' ORDER BY rowid DESC LIMIT 1",cid);
+  if(request){payload.request=request;payload.message=one('SELECT * FROM messages WHERE id=?',request.assistant_message_id)}
+ }
+ persistEvent(cid,job,event,payload);publishStatus(cid,event,job);
 }
 
 export function subscribe(cid,after,listener){
  // Synchronous query+listener registration: no lost-event window.
- const rows=query('SELECT seq,event,payload FROM queue_events WHERE conversation_id=? AND seq>? ORDER BY seq ASC',cid,after);
- for(const e of rows)listener({seq:e.seq,event:e.event,payload:JSON.parse(e.payload)});
+ flushDeltas(cid);
+ const floor=one('SELECT seq FROM event_floors WHERE conversation_id=?',cid)?.seq||0;
+ const size=one('SELECT COUNT(*) AS count,COALESCE(SUM(length(CAST(payload AS BLOB))),0) AS bytes FROM (SELECT payload FROM queue_events WHERE conversation_id=? AND seq>? ORDER BY seq LIMIT 1001)',cid,after);
+ if(after<floor||size.count>1000||size.bytes>1024*1024)listener({event:'reset',payload:{reason:'snapshot_required'}});
+ else for(const e of query('SELECT seq,event,payload FROM queue_events WHERE conversation_id=? AND seq>? ORDER BY seq ASC',cid,after))listener({seq:e.seq,event:e.event,payload:JSON.parse(e.payload)});
  bus.on(cid,listener);
  return ()=>bus.off(cid,listener);
 }
@@ -34,7 +65,8 @@ export function subscribe(cid,after,listener){
 export function queueState(cid){
  return {
   paused:isPaused(cid),
-  jobs:query("SELECT id,conversation_id,content,state,created_at,started_at,finished_at,error_text FROM queue_jobs WHERE conversation_id=? AND state IN ('queued','running') ORDER BY rowid ASC",cid)
+  reason:one('SELECT reason FROM queue_pauses WHERE conversation_id=?',cid)?.reason||null,
+  jobs:query("SELECT id,conversation_id,SUBSTR(content,1,100) AS content,state,created_at,started_at,finished_at,error_text FROM queue_jobs WHERE conversation_id=? AND state IN ('queued','running') ORDER BY rowid ASC",cid)
  };
 }
 export function allQueued(){
@@ -82,18 +114,29 @@ export function cancel(cid,jobId){
  if(row.state!=='queued')return {error:'只能取消尚未開始的訊息',code:409};
  run("UPDATE queue_jobs SET state='cancelled',finished_at=? WHERE id=? AND state='queued'",utcNow(),jobId);
  emit(cid,jobId,'cancelled',{request_id:jobId});
- return {ok:true};
+ return {ok:true,queue:queueState(cid)};
 }
-export function stop(cid){
+export function stop(cid,{pause=false}={}){
+ if(pause)pauseQueue(cid);
  const job=active.get(cid);
  if(job){job.stopped=true;job.controller.abort('stopped')}
- return {ok:true,stopping:!!job};
+ return {ok:true,stopping:!!job,queue:queueState(cid)};
+}
+export function pauseQueue(cid){
+ run("INSERT OR REPLACE INTO queue_pauses(conversation_id,reason) VALUES(?,'MANUAL')",cid);
+ emit(cid,null,'paused',{reason:'MANUAL'});return {ok:true,queue:queueState(cid)};
+}
+export function cancelPending(cid){
+ const jobs=query("SELECT id FROM queue_jobs WHERE conversation_id=? AND state='queued'",cid);
+ run("UPDATE queue_jobs SET state='cancelled',finished_at=? WHERE conversation_id=? AND state='queued'",utcNow(),cid);
+ if(jobs.length)emit(cid,null,'cancelled',{request_ids:jobs.map(j=>j.id)});
+ return {ok:true,cancelled:jobs.length,queue:queueState(cid)};
 }
 export function resume(cid){
  run('DELETE FROM queue_pauses WHERE conversation_id=?',cid);
  emit(cid,null,'resumed',{});
  setImmediate(()=>kick(cid));
- return {ok:true};
+ return {ok:true,queue:queueState(cid)};
 }
 
 function finishJob(job,state,errorText=null){
@@ -116,17 +159,20 @@ async function execute(job,entry){
   if(!provider)throw Error('供應商已被刪除');
   run("INSERT INTO messages(id,conversation_id,role,content) VALUES(?,?,'user',?)",uid,cid,job.content);
   run("INSERT INTO messages(id,conversation_id,role,content,thinking_content,status) VALUES(?,?,'assistant','','','running')",aid,cid);
+  entry.message={id:aid,job_id:job.id,content:'',thinking_content:''};
   run(`INSERT INTO requests(id,conversation_id,assistant_message_id,provider_id,provider_name,model_id,started_at,thinking_mode,thinking_effort,thinking_budget_tokens)
     VALUES(?,?,?,?,?,?,?,?,?,?)`,rid,cid,aid,provider.id,provider.name,model,started,
     JSON.parse(job.thinking_json).mode,JSON.parse(job.thinking_json).effort,JSON.parse(job.thinking_json).budget_tokens);
   run('UPDATE conversations SET updated_at=? WHERE id=?',utcNow(),cid);
   messages=query("SELECT role,content FROM messages WHERE conversation_id=? AND id!=? AND status IN ('complete','stopped') ORDER BY created_at,rowid",cid,aid);
-  emit(cid,job.id,'started',{request_id:job.id,user_id:uid,assistant_id:aid,started_at:started});
+  emit(cid,job.id,'started',{request_id:job.id,user_id:uid,assistant_id:aid,started_at:started,
+   messages:query('SELECT * FROM messages WHERE id IN (?,?) ORDER BY rowid',uid,aid),
+   request:one('SELECT id,assistant_message_id,status,started_at,thinking_mode,thinking_effort,thinking_budget_tokens FROM requests WHERE id=?',rid)});
   reset();
   await streamProvider({provider,model,system:job.system_prompt,messages,thinking:JSON.parse(job.thinking_json),signal:ctrl.signal,
    onActivity:reset,
-   onDelta:delta=>{content+=delta;checkpoint();emit(cid,job.id,'delta',{request_id:job.id,assistant_id:aid,text:delta})},
-   onThinking:delta=>{thinkingContent+=delta;checkpoint();emit(cid,job.id,'thinking_delta',{request_id:job.id,assistant_id:aid,text:delta})},
+   onDelta:delta=>{content+=delta;entry.message.content=content;checkpoint();emit(cid,job.id,'delta',{request_id:job.id,assistant_id:aid,text:delta})},
+   onThinking:delta=>{thinkingContent+=delta;entry.message.thinking_content=thinkingContent;checkpoint();emit(cid,job.id,'thinking_delta',{request_id:job.id,assistant_id:aid,text:delta})},
    onUsage:(u,r)=>{usage=u;finishReason=r},
    onFinished:(u,r)=>{usage=u;finishReason=r}});
   const n=normalizedUsage(provider.protocol,usage);
@@ -169,9 +215,20 @@ export async function kick(cid){
   }
  }finally{
   active.delete(cid);
+  publishStatus(cid);
   setImmediate(()=>kick(cid));
  }
 }
+// Keep cursor floors so clients reconnecting past retention explicitly fetch a snapshot.
+export function pruneEvents(){
+ const old=query("SELECT conversation_id,MAX(seq) AS seq FROM queue_events WHERE datetime(created_at)<datetime('now','-7 days') AND conversation_id NOT IN (SELECT conversation_id FROM queue_jobs WHERE state IN ('running','queued')) GROUP BY conversation_id");
+ db.exec('BEGIN IMMEDIATE');
+ try{
+  for(const item of old){run('INSERT INTO event_floors(conversation_id,seq) VALUES(?,?) ON CONFLICT(conversation_id) DO UPDATE SET seq=MAX(seq,excluded.seq)',item.conversation_id,item.seq);run('DELETE FROM queue_events WHERE conversation_id=? AND seq<=?',item.conversation_id,item.seq)}
+  db.exec('COMMIT');
+ }catch(error){db.exec('ROLLBACK');throw error}
+}
+setInterval(()=>{try{pruneEvents()}catch{console.error('Event retention cleanup failed; will retry next hour')}},3600000).unref();
 export function recoverQueue(){
  // An upstream request cannot safely be reissued after a process crash:
  // the provider may have billed it already. Pause for explicit user action.

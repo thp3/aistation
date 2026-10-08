@@ -10,7 +10,7 @@
     "start": "node server/index.js",
     "test": "node --test tests/*.test.js",
     "test:ui": "node --test tests/ui.browser.js",
-    "check": "node --check server/index.js && node --check server/provider.js && node --check server/db.js && node --check server/thinking.js && node --check server/queue.js && node --check server/naming.js && node --check src/sse.js && node --check src/main.js && node --check src/chat-state.js && node --check server/static-cache.js && node --check src/markdown.js && node --check src/math.js && node --check src/highlight.js && node --check vite.config.js"
+    "check": "node --check server/index.js && node --check server/provider.js && node --check server/db.js && node --check server/thinking.js && node --check server/queue.js && node --check server/naming.js && node --check src/sse.js && node --check src/main.js && node --check src/chat-state.js && node --check server/static-cache.js && node --check src/markdown.js && node --check src/math.js && node --check src/highlight.js && node --check vite.config.js && node --check src/api.js && node --check src/feedback.js && node --check server/views.js && node --check server/event-stream.js"
   },
   "dependencies": {
     "dompurify": "^3.2.7",

@@ -121,6 +121,11 @@ CREATE TABLE IF NOT EXISTS queue_events (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_queue_events_convo_seq ON queue_events(conversation_id,seq);
+CREATE TABLE IF NOT EXISTS event_floors (
+ conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+ seq INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_page ON conversations(updated_at DESC,id DESC);
 `);
 export const id = () => crypto.randomUUID();
 const secret = process.env.DATA_ENCRYPTION_KEY;

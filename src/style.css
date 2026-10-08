@@ -37,3 +37,30 @@ button:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
 
 .plain-message { white-space: pre-wrap; }
 .format-notice { padding: 8px 16px; color: var(--muted); font-size: 12px; }
+.connection-state { font-size: 12px; color: var(--muted); margin-left: auto; padding: 0 12px; white-space: nowrap; }
+.connection-state[data-connected="true"] { color: #517257; }
+.conversation-search { margin-bottom: 12px; }
+#modelSearch { margin-bottom: 6px; padding: 5px 10px; }
+.older-messages { align-self: center; flex: none; margin: 6px 0; padding: 5px 12px; font-size: 12px; }
+.queue-controls { display: flex; flex-wrap: wrap; gap: 6px; }
+.queue { max-height: min(24dvh, 200px); overflow-y: auto; }
+.queue-controls button { padding: 5px 8px; font-size: 12px; }
+.inline-error { color: var(--error); margin: 4px 0; overflow-wrap: anywhere; }
+.notifications { position: fixed; right: max(16px, env(safe-area-inset-right)); bottom: max(16px, env(safe-area-inset-bottom)); z-index: 100; display: grid; gap: 8px; width: min(420px, calc(100vw - 32px)); pointer-events: none; }
+.notification { pointer-events: auto; display: flex; align-items: center; gap: 12px; padding: 12px 16px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--canvas); box-shadow: 0 4px 24px #18171518; overflow-wrap: anywhere; }
+.notification span { flex: 1; min-width: 0; }
+.notification.error { border-left: 4px solid var(--error); }
+.notification.success { border-left: 4px solid #517257; }
+.notification.info { border-left: 4px solid var(--primary); }
+.dialog-backdrop { position: fixed; inset: 0; z-index: 110; background: #18171580; display: grid; place-items: center; padding: 20px; }
+.app-dialog { width: min(440px, 100%); max-height: calc(100dvh - 40px); overflow: auto; background: var(--canvas); border: 1px solid var(--hairline); border-radius: 16px; padding: 24px; box-shadow: 0 12px 60px #0003; }
+.app-dialog h2 { margin: 0 0 12px; font-size: 22px; }
+.app-dialog p { color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.app-dialog .actions { margin-top: 24px; justify-content: flex-end; }
+.app-dialog .primary.danger { background: var(--error); color: white; }
+@media (max-width: 680px) {
+ .connection-state { font-size: 10px; padding: 0 4px; }
+ .sidebar .conversation-search { width: 84px; flex: none; margin: 0; padding: 8px; }
+ .notifications { bottom: max(12px, env(safe-area-inset-bottom)); right: 12px; width: calc(100vw - 24px); }
+ .app-dialog input { font-size: 16px; }
+}
