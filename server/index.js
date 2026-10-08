@@ -1,0 +1,82 @@
+import 'dotenv/config';
+import express from 'express';
+import crypto from 'node:crypto';
+import path from 'node:path';
+import fs from 'node:fs';
+import {db,id,query,one,run,encrypt,publicProvider,utcNow,getSetting,setSetting} from './db.js';
+import {validateEndpoint,discoverModels,streamProvider,normalizedUsage,redact} from './provider.js';
+const app=express();app.disable('x-powered-by');app.use(express.json({limit:'1mb'}));
+app.use((req,res,next)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Cache-Control','no-store');res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; connect-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'");next()});
+if(!process.env.ADMIN_USERNAME||!process.env.ADMIN_PASSWORD||process.env.ADMIN_PASSWORD.length<12||!process.env.SESSION_SECRET||process.env.SESSION_SECRET.length<32)throw Error('Configure secure ADMIN_USERNAME, ADMIN_PASSWORD and SESSION_SECRET in .env');
+const hash=s=>crypto.createHmac('sha256',process.env.SESSION_SECRET).update(s).digest('hex');
+const cookie=req=>Object.fromEntries((req.headers.cookie||'').split(';').map(x=>x.trim().split('=').slice(0,2)));
+function auth(req,res,next){const token=cookie(req).session||'';const session=token?one('SELECT expires_at FROM sessions WHERE token_hash=?',hash(token)):null;if(!session||session.expires_at<Date.now())return res.status(401).json({error:'請先登入'});req.sessionToken=token;next();}
+function csrf(req,res,next){if(['POST','PATCH','PUT','DELETE'].includes(req.method)&&req.headers.origin){try{if(new URL(req.headers.origin).host!==req.headers.host)return res.status(403).json({error:'Invalid origin'});}catch{return res.status(403).json({error:'Invalid origin'});}}next();}
+app.use('/api',csrf);
+const attempts=new Map();
+app.post('/api/login',(req,res)=>{const ip=req.ip||'unknown', entry=attempts.get(ip)||{count:0,until:0};if(entry.until>Date.now())return res.status(429).json({error:'嘗試次數過多，稍後重試'});const a=Buffer.from(String(req.body.username||'')),b=Buffer.from(process.env.ADMIN_USERNAME),c=Buffer.from(String(req.body.password||'')),d=Buffer.from(process.env.ADMIN_PASSWORD);if(!(a.length===b.length&&crypto.timingSafeEqual(a,b)&&c.length===d.length&&crypto.timingSafeEqual(c,d))){entry.count++;if(entry.count>=5){entry.until=Date.now()+900000;entry.count=0;}attempts.set(ip,entry);return res.status(401).json({error:'帳號或密碼錯誤'});}attempts.delete(ip);const token=crypto.randomBytes(32).toString('hex');const days=Math.max(1,Math.min(30,Number(process.env.SESSION_DAYS)||7));run('INSERT INTO sessions(token_hash,expires_at) VALUES(?,?)',hash(token),Date.now()+days*86400000);res.setHeader('Set-Cookie',`session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${days*86400}`);res.json({ok:true});});
+app.post('/api/logout',auth,(req,res)=>{run('DELETE FROM sessions WHERE token_hash=?',hash(req.sessionToken));res.setHeader('Set-Cookie','session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');res.json({ok:true})});
+app.get('/api/me',auth,(req,res)=>res.json({username:process.env.ADMIN_USERNAME}));
+app.get('/api/providers',auth,(req,res)=>res.json(query('SELECT * FROM providers ORDER BY created_at DESC').map(publicProvider)));
+app.post('/api/providers',auth,async(req,res)=>{try{const {name,protocol,endpoint,api_key}=req.body;if(!String(name||'').trim()||!['openai','claude'].includes(protocol)||!String(api_key||'').trim())return res.status(400).json({error:'請填寫名稱、協定與 API Key'});const url=validateEndpoint(endpoint,protocol);const pid=id();run('INSERT INTO providers(id,name,protocol,endpoint,encrypted_key) VALUES(?,?,?,?,?)',pid,String(name).trim(),protocol,url,encrypt(api_key));let discovery_error=null,models_found=0;try{const p=one('SELECT * FROM providers WHERE id=?',pid);const models=await discoverModels(p);for(const model of models)run("INSERT INTO models(id,provider_id,model_id,source) VALUES(?,?,?,'discovered') ON CONFLICT(provider_id,model_id) DO UPDATE SET updated_at=excluded.updated_at",id(),pid,model);models_found=models.length;}catch(e){discovery_error=redact(e.raw||e.message,[api_key]);}res.status(201).json({id:pid,models_found,discovery_error});}catch(e){res.status(400).json({error:e.message})}});
+app.patch('/api/providers/:id',auth,(req,res)=>{try{const p=one('SELECT * FROM providers WHERE id=?',req.params.id);if(!p)return res.sendStatus(404);const protocol=req.body.protocol||p.protocol;const endpoint=validateEndpoint(req.body.endpoint||p.endpoint,protocol);const name=String(req.body.name??p.name).trim();if(!name)throw Error('名稱不可空白');run('UPDATE providers SET name=?,protocol=?,endpoint=?,encrypted_key=?,updated_at=? WHERE id=?',name,protocol,endpoint,req.body.api_key?encrypt(req.body.api_key):p.encrypted_key,utcNow(),p.id);res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
+app.delete('/api/providers/:id',auth,(req,res)=>{run('DELETE FROM providers WHERE id=?',req.params.id);res.json({ok:true})});
+async function scan(req,res){const p=one('SELECT * FROM providers WHERE id=?',req.params.id);if(!p)return res.sendStatus(404);try{const ids=await discoverModels(p);for(const model of ids)run("INSERT INTO models(id,provider_id,model_id,source) VALUES(?,?,?,'discovered') ON CONFLICT(provider_id,model_id) DO UPDATE SET updated_at=excluded.updated_at",id(),p.id,model);res.json({count:ids.length,models:ids});}catch(e){res.status(e.status||502).json({error:redact(e.raw||e.message),provider_code:e.provider_code||null,http_status:e.status||null})}}
+app.post('/api/providers/:id/scan',auth,scan);
+app.post('/api/providers/:id/test',auth,async(req,res)=>{const p=one('SELECT * FROM providers WHERE id=?',req.params.id);if(!p)return res.sendStatus(404);try{const ids=await discoverModels(p);res.json({ok:true,models_found:ids.length})}catch(e){res.status(e.status||502).json({error:redact(e.raw||e.message),provider_code:e.provider_code||null})}});
+app.get('/api/models',auth,(req,res)=>res.json(query('SELECT m.*,p.name AS provider_name,p.protocol AS protocol,p.endpoint AS endpoint FROM models m JOIN providers p ON m.provider_id=p.id ORDER BY p.name,m.model_id')));
+app.post('/api/models',auth,(req,res)=>{const {provider_id,model_id}=req.body;if(!one('SELECT id FROM providers WHERE id=?',provider_id)||!String(model_id||'').trim())return res.status(400).json({error:'無效模型'});try{run("INSERT INTO models(id,provider_id,model_id,source) VALUES(?,?,?,'manual') ON CONFLICT(provider_id,model_id) DO UPDATE SET source='manual',enabled=1,updated_at=excluded.updated_at",id(),provider_id,String(model_id).trim());res.status(201).json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
+app.patch('/api/models/:id',auth,(req,res)=>{run('UPDATE models SET enabled=? WHERE id=?',req.body.enabled?1:0,req.params.id);res.json({ok:true})});
+app.delete('/api/models/:id',auth,(req,res)=>{run('DELETE FROM models WHERE id=?',req.params.id);res.json({ok:true})});
+app.get('/api/settings',auth,(req,res)=>res.json({default_system_prompt:getSetting('default_system_prompt')}));
+app.patch('/api/settings',auth,(req,res)=>{setSetting('default_system_prompt',String(req.body.default_system_prompt||''));res.json({ok:true})});
+const convoSql='SELECT * FROM conversations';
+app.get('/api/conversations',auth,(req,res)=>res.json(query(convoSql+' ORDER BY updated_at DESC')));
+app.post('/api/conversations',auth,(req,res)=>{const cid=id();const system=String(req.body.system_prompt??getSetting('default_system_prompt'));run('INSERT INTO conversations(id,title,system_prompt,provider_id,model_id) VALUES(?,?,?,?,?)',cid,String(req.body.title||'新的對話').slice(0,120),system,req.body.provider_id||null,req.body.model_id||null);res.status(201).json(one(convoSql+' WHERE id=?',cid))});
+app.get('/api/conversations/:id',auth,(req,res)=>{const c=one(convoSql+' WHERE id=?',req.params.id);if(!c)return res.sendStatus(404);res.json({...c,messages:query('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at,rowid',c.id),requests:query('SELECT * FROM requests WHERE conversation_id=? ORDER BY started_at',c.id)})});
+app.patch('/api/conversations/:id',auth,(req,res)=>{const c=one(convoSql+' WHERE id=?',req.params.id);if(!c)return res.sendStatus(404);const pid=req.body.provider_id===undefined?c.provider_id:req.body.provider_id;const mid=req.body.model_id===undefined?c.model_id:req.body.model_id;if(pid&&mid&&!one('SELECT id FROM models WHERE provider_id=? AND model_id=? AND enabled=1',pid,mid))return res.status(400).json({error:'模型未啟用'});run('UPDATE conversations SET title=?,system_prompt=?,provider_id=?,model_id=?,updated_at=? WHERE id=?',String(req.body.title??c.title).slice(0,120),String(req.body.system_prompt??c.system_prompt),pid,mid,utcNow(),c.id);res.json(one(convoSql+' WHERE id=?',c.id))});
+app.delete('/api/conversations/:id',auth,(req,res)=>{active.get(req.params.id)?.controller.abort('deleted');run('DELETE FROM conversations WHERE id=?',req.params.id);res.json({ok:true})});
+app.get('/api/stats',auth,(req,res)=>res.json({requests:one("SELECT COUNT(*) AS count, SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) AS completed FROM requests"),usage:one('SELECT SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,SUM(total_tokens) AS total_tokens,SUM(cache_read_tokens) AS cache_read_tokens,SUM(cache_creation_tokens) AS cache_creation_tokens,SUM(reasoning_tokens) AS reasoning_tokens FROM requests'),by_model:query('SELECT provider_name,model_id,COUNT(*) AS calls,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens FROM requests GROUP BY provider_name,model_id ORDER BY calls DESC'),recent:query('SELECT * FROM requests ORDER BY started_at DESC LIMIT 30')}));
+app.get('/api/export',auth,(req,res)=>{const type=req.query.type==='settings'?'settings':'chats';const data=type==='chats'?{conversations:query('SELECT * FROM conversations'),messages:query('SELECT * FROM messages'),requests:query('SELECT * FROM requests')}:{providers:query('SELECT id,name,protocol,endpoint,created_at FROM providers'),models:query('SELECT * FROM models'),settings:query('SELECT * FROM settings')};res.setHeader('Content-Disposition',`attachment; filename="aistation-${type}.json"`);res.type('json').send(JSON.stringify({exported_at:utcNow(),type,...data},null,2))});
+const active=new Map();
+app.post('/api/conversations/:id/stop',auth,(req,res)=>{const a=active.get(req.params.id);if(a){a.stopped=true;a.controller.abort('stopped')}res.json({ok:true,stopping:!!a})});
+app.post('/api/conversations/:id/send',auth,async(req,res)=>{
+ const cid=req.params.id, convo=one(convoSql+' WHERE id=?',cid);
+ if(!convo)return res.status(404).json({error:'對話不存在'});
+ if(active.has(cid))return res.status(409).json({error:'此對話正進行生成'});
+ const content=String(req.body.content||'').trim();if(!content||content.length>100000)return res.status(400).json({error:'訊息不可空白或過長'});
+ const p=one('SELECT * FROM providers WHERE id=?',convo.provider_id);
+ if(!p||!convo.model_id||!one('SELECT id FROM models WHERE provider_id=? AND model_id=? AND enabled=1',p.id,convo.model_id))return res.status(400).json({error:'請先選擇有效模型'});
+ const controller=new AbortController();const state={controller,stopped:false};active.set(cid,state);res.on('close',()=>{if(!res.writableEnded&&!controller.signal.aborted)controller.abort('client_disconnected')});
+ const started=utcNow(),uid=id(),aid=id(),rid=id();
+ run("INSERT INTO messages(id,conversation_id,role,content) VALUES(?,?,'user',?)",uid,cid,content);
+ run("INSERT INTO messages(id,conversation_id,role,content,status) VALUES(?,?,'assistant','','running')",aid,cid);
+ run('INSERT INTO requests(id,conversation_id,assistant_message_id,provider_id,provider_name,model_id,started_at) VALUES(?,?,?,?,?,?,?)',rid,cid,aid,p.id,p.name,convo.model_id,started);
+ run('UPDATE conversations SET updated_at=? WHERE id=?',utcNow(),cid);
+ const messages=query("SELECT role,content FROM messages WHERE conversation_id=? AND id!=? AND status IN ('complete','stopped') ORDER BY created_at,rowid",cid,aid);
+ res.status(200).set({'Content-Type':'text/event-stream; charset=utf-8','Connection':'keep-alive','X-Accel-Buffering':'no','Cache-Control':'no-cache, no-transform'});res.flushHeaders();
+ const send=(event,data)=>{if(!res.destroyed)res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)};
+ send('started',{request_id:rid,user_id:uid,assistant_id:aid,started_at:started});
+ let accumulated='',usage={},finishReason=null,completed=false;
+ let idle;
+ const reset=()=>{clearTimeout(idle);idle=setTimeout(()=>controller.abort('idle_timeout'),Math.max(10000,Number(process.env.UPSTREAM_IDLE_TIMEOUT_MS)||90000))};
+ const max=setTimeout(()=>controller.abort('max_timeout'),Math.max(30000,Number(process.env.UPSTREAM_MAX_TIMEOUT_MS)||600000));
+ const onUsage=(u,r)=>{usage=u;finishReason=r;};
+ try{
+ reset();
+ await streamProvider({provider:p,model:convo.model_id,system:convo.system_prompt,messages,signal:controller.signal,onDelta:delta=>{reset();accumulated+=delta;send('delta',{text:delta})},onUsage,onFinished:(u,r)=>{usage=u;finishReason=r;completed=true}});
+ const n=normalizedUsage(p.protocol,usage);
+ run('UPDATE messages SET content=?,status=? WHERE id=?',accumulated,'complete',aid);
+ run('UPDATE requests SET status=?,input_tokens=?,output_tokens=?,total_tokens=?,cache_read_tokens=?,cache_creation_tokens=?,reasoning_tokens=?,usage_raw=?,finish_reason=?,finished_at=? WHERE id=?','complete',n.input_tokens,n.output_tokens,n.total_tokens,n.cache_read_tokens,n.cache_creation_tokens,n.reasoning_tokens,JSON.stringify(usage),finishReason,utcNow(),rid);
+ send('complete',{request_id:rid,usage:n,finish_reason:finishReason});
+ }catch(e){
+ const status=state.stopped?'stopped':controller.signal.aborted?'error':'error';const n=normalizedUsage(p.protocol,usage);
+ const raw=redact(e.raw||e.message||String(e),[]);const code=state.stopped?'USER_STOP':controller.signal.aborted?String(controller.signal.reason||'TIMEOUT'):(e.provider_code||'unknown');
+ run('UPDATE messages SET content=?,status=? WHERE id=?',accumulated,status,aid);
+ run('UPDATE requests SET status=?,input_tokens=?,output_tokens=?,total_tokens=?,cache_read_tokens=?,cache_creation_tokens=?,reasoning_tokens=?,usage_raw=?,finish_reason=?,http_status=?,provider_error_code=?,error_body=?,finished_at=? WHERE id=?',status,n.input_tokens,n.output_tokens,n.total_tokens,n.cache_read_tokens,n.cache_creation_tokens,n.reasoning_tokens,JSON.stringify(usage),finishReason,e.status||null,code,status==='stopped'?null:raw,utcNow(),rid);
+ send(status==='stopped'?'stopped':'error',{request_id:rid,http_status:e.status||null,provider_code:code,error:status==='stopped'?'已停止生成':raw,started_at:started,partial:accumulated});
+ }finally{clearTimeout(idle);clearTimeout(max);active.delete(cid);res.end();}
+});
+app.use(express.static(path.resolve('dist'),{index:false}));
+app.get('/{*any}',(req,res)=>{const p=path.resolve('dist/index.html');if(fs.existsSync(p))res.sendFile(p);else res.status(503).send('Frontend is not built. Run npm run build.');});
+const port=Number(process.env.PORT||3000);app.listen(port,process.env.HOST||'0.0.0.0',()=>console.log(`AI Station listening on ${process.env.HOST||'0.0.0.0'}:${port}`));
