@@ -1,4 +1,5 @@
 import { decrypt } from './db.js';
+import { SSEParser } from '../src/sse.js';
 
 export function redact(text, secrets=[]) {
   let out=String(text ?? '');
@@ -37,53 +38,57 @@ export function providerError(status,raw,key=''){
   err.provider_code=String(obj?.error?.code||obj?.error?.type||obj?.code||'unknown');
   err.raw=redact(raw,[key]);return err;
 }
-export function requestSpec(provider,model,system,messages){
+export function requestSpec(provider,model,system,messages,thinking={params:{}}){
  const body=provider.protocol==='openai'?
   {model,stream:true,stream_options:{include_usage:true},messages:[...(system?[{role:'system',content:system}]:[]),...messages]}:
   {model,max_tokens:4096,stream:true,...(system?{system}:{}),messages};
+ Object.assign(body,thinking.params||{});
  const headers={'Content-Type':'application/json',...authHeaders(provider)};
  return {body,headers};
 }
-export async function streamProvider({provider,model,system,messages,signal,onDelta,onUsage,onFinished}){
- const key=decrypt(provider.encrypted_key), spec=requestSpec(provider,model,system,messages);
+export async function streamProvider({provider,model,system,messages,thinking,signal,onDelta,onThinking=()=>{},onActivity=()=>{},onUsage,onFinished}){
+ const key=decrypt(provider.encrypted_key), spec=requestSpec(provider,model,system,messages,thinking);
  const res=await fetch(provider.endpoint,{method:'POST',headers:spec.headers,body:JSON.stringify(spec.body),signal});
  if(!res.ok) throw providerError(res.status,await res.text(),key);
  if(!res.body)throw Error('Provider returned no SSE body');
- let buffer='',finished=false, usage={}, reason=null;
- const emit=raw=>{
-   if(!raw||raw==='[DONE]')return;
+ let finished=false, usage={}, reason=null;
+ const emit=({event,data:raw})=>{
+   if(provider.protocol==='openai'&&raw==='[DONE]'){finished=true;return;}
    let ev;try{ev=JSON.parse(raw)}catch{return}
    if(provider.protocol==='openai'){
-     if(ev.error)throw providerError(res.status,JSON.stringify(ev.error),key);
+     if(ev.error||ev.type==='error')throw providerError(res.status,JSON.stringify(ev.error||ev),key);
      const choice=ev.choices?.[0];
      const delta=choice?.delta?.content;if(typeof delta==='string')onDelta(delta);
+     // OpenAI official Chat Completions does not expose raw reasoning.
+     // Some compatible relays do supply reasoning_content / reasoning / thinking.
+     const reasoning=choice?.delta?.reasoning_content ?? choice?.delta?.reasoning ?? choice?.delta?.thinking;
+     if(typeof reasoning==='string'&&reasoning)onThinking(reasoning);
      if(ev.usage)usage={...usage,...ev.usage};
-     if(choice?.finish_reason){finished=true;reason=choice.finish_reason;}
+     if(choice?.finish_reason)reason=choice.finish_reason;
    }else{
      if(ev.type==='error')throw providerError(res.status,JSON.stringify(ev.error),key);
+     if(ev.type==='content_block_start'&&ev.content_block?.type==='thinking'&&ev.content_block?.thinking)
+       onThinking(ev.content_block.thinking);
      if(ev.type==='content_block_delta'&&ev.delta?.type==='text_delta')onDelta(ev.delta.text||'');
+     if(ev.type==='content_block_delta'&&ev.delta?.type==='thinking_delta'&&typeof ev.delta.thinking==='string')
+       onThinking(ev.delta.thinking);
      if(ev.type==='message_start'&&ev.message?.usage)usage={...usage,...ev.message.usage};
      if(ev.type==='message_delta'){usage={...usage,...ev.usage};reason=ev.delta?.stop_reason||reason;}
      if(ev.type==='message_stop')finished=true;
    }
    onUsage(usage,reason);
  };
+ const parser=new SSEParser(emit);
  for await (const chunk of res.body){
-   buffer+=new TextDecoder().decode(chunk,{stream:true});
-   if(buffer.length>2000000)throw Error('Provider SSE frame exceeds limit');
-   while(buffer.includes('\n\n')){
-      const pos=buffer.indexOf('\n\n'),frame=buffer.slice(0,pos);buffer=buffer.slice(pos+2);
-      const lines=frame.split('\n').filter(x=>x.startsWith('data:')).map(x=>x.slice(5).trimStart());
-      if(lines.length)emit(lines.join('\n'));
-   }
-   buffer=buffer.replace(/\r\n/g,'\n');
+   onActivity();
+   parser.feed(chunk);
  }
- if(buffer.trim()){const lines=buffer.split('\n').filter(x=>x.startsWith('data:')).map(x=>x.slice(5).trimStart());if(lines.length)emit(lines.join('\n'));}
+ parser.end();
  if(!finished)throw Error('Upstream ended without an official completion event');
  onFinished(usage,reason);
 }
 export function normalizedUsage(protocol,u={}){
  const v=(...xs)=>{for(const x of xs)if(Number.isSafeInteger(x)&&x>=0)return x;return null};
  if(protocol==='openai')return {input_tokens:v(u.prompt_tokens),output_tokens:v(u.completion_tokens),total_tokens:v(u.total_tokens),cache_read_tokens:v(u.prompt_tokens_details?.cached_tokens),cache_creation_tokens:null,reasoning_tokens:v(u.completion_tokens_details?.reasoning_tokens)};
- return {input_tokens:v(u.input_tokens),output_tokens:v(u.output_tokens),total_tokens:v(u.total_tokens),cache_read_tokens:v(u.cache_read_input_tokens),cache_creation_tokens:v(u.cache_creation_input_tokens),reasoning_tokens:null};
+ return {input_tokens:v(u.input_tokens),output_tokens:v(u.output_tokens),total_tokens:v(u.total_tokens),cache_read_tokens:v(u.cache_read_input_tokens),cache_creation_tokens:v(u.cache_creation_input_tokens),reasoning_tokens:v(u.output_tokens_details?.thinking_tokens,u.thinking_tokens)};
 }

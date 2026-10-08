@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
   role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-  content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'complete',
+  content TEXT NOT NULL, thinking_content TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'complete',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS requests (
@@ -48,6 +49,19 @@ CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(conversation_id,create
 CREATE INDEX IF NOT EXISTS idx_requests_convo ON requests(conversation_id,started_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
 `);
+// Add fields without recreating tables or dropping existing conversations.
+const requestColumns = new Set(db.prepare('PRAGMA table_info(requests)').all().map(c => c.name));
+for (const [name, definition] of [
+  ['thinking_mode', "TEXT NOT NULL DEFAULT 'default'"],
+  ['thinking_effort', 'TEXT'],
+  ['thinking_budget_tokens', 'INTEGER']
+]) {
+  if (!requestColumns.has(name)) db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${definition}`);
+}
+const messageColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map(c => c.name));
+if (!messageColumns.has('thinking_content')) {
+  db.exec("ALTER TABLE messages ADD COLUMN thinking_content TEXT NOT NULL DEFAULT ''");
+}
 export const id = () => crypto.randomUUID();
 const secret = process.env.DATA_ENCRYPTION_KEY;
 if (!secret || secret.length < 32) throw new Error('DATA_ENCRYPTION_KEY must be at least 32 characters');
