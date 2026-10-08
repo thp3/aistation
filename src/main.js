@@ -1,7 +1,5 @@
 import './style.css';
-import {SSEParser} from './sse.js';
 import {DraftStore,LatestRequest} from './chat-state.js';
-import {marked} from 'marked';import DOMPurify from 'dompurify';import hljs from 'highlight.js';import katex from 'katex';import 'katex/dist/katex.min.css';import 'highlight.js/styles/github-dark.css';
 const root=document.querySelector('#app');
 const drafts=new DraftStore(),detailRequests=new LatestRequest(),submissions=new Map();
 const messagePositions=new Map();
@@ -14,19 +12,39 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const api=async(path,method='GET',body,options={})=>{const r=await fetch('/api'+path,{method,...options,headers:{'Content-Type':'application/json'},...(body!==undefined?{body:JSON.stringify(body)}:{})});let j=await r.json().catch(()=>({error:r.statusText}));if(!r.ok)throw Error(j.error||String(r.status));return j};
 const request=async(fn)=>{try{return await fn()}catch(e){alert(e.message);throw e}};
 const fmt=v=>v==null?'未知':Number(v).toLocaleString('zh-TW');
+let markdownRenderer=null,markdownLoading=null,markdownFailed=false,formatVersion=0;
+function updateFormatNotice(){
+ const notice=$('#formatNotice');
+ if(!notice)return;
+ notice.hidden=!markdownFailed;
+ notice.innerHTML=markdownFailed?'訊息已載入，格式暫時無法載入。 <button class="subtle" id="retryFormat">重新整理</button>':'';
+ if(markdownFailed)$('#retryFormat').onclick=()=>{captureView();location.reload()};
+}
+function refreshFormatting(){formatVersion++;renderMessages()}
+function loadMarkdown(){
+ if(markdownLoading||markdownFailed)return;
+ markdownLoading=import('./markdown.js').then(module=>{
+   markdownRenderer=module.createMarkdownRenderer(refreshFormatting,()=>{markdownFailed=true;updateFormatNotice()});
+   refreshFormatting();
+ }).catch(()=>{markdownFailed=true;formatVersion++;renderMessages()});
+}
 function renderMarkdown(raw){
- let str=String(raw||'');
- const math=[];
- str=str.replace(/\$\$([\s\S]+?)\$\$|\$([^\n$]+?)\$/g,(match,block,inline)=>{const token='MATHPLACEHOLDER'+math.length+'END';try{math.push(katex.renderToString(block||inline,{displayMode:!!block,throwOnError:false,trust:false,strict:'ignore'}))}catch{math.push(esc(match))}return token});
- const html=marked.parse(str,{breaks:true,gfm:true});
- return DOMPurify.sanitize(html,{ADD_ATTR:['class']}).replace(/MATHPLACEHOLDER(\d+)END/g,(_,i)=>math[Number(i)]||'');
+ const text=String(raw||'');
+ if(!text)return '';
+ if(markdownRenderer)return markdownRenderer.render(text);
+ loadMarkdown();
+ return '<div class="plain-message">'+esc(text)+'</div>';
+}
+function updateGenerationPolling(){
+ clearInterval(generationPoll);generationPoll=null;
+ if(state.me&&!document.hidden)generationPoll=setInterval(()=>syncGenerations().catch(()=>{}),2500);
 }
 function shell(){root.innerHTML=`<header class="top"><div class="brand"><span class="spark">✳</span> AI Station <span class="brand-sub">PRIVATE WORKSPACE</span></div><nav><button data-tab="chat" class="${state.tab==='chat'?'on':''}"><span class="desktop-label">聊天工作區</span><span class="mobile-label">聊天</span></button><button data-tab="admin" class="${state.tab==='admin'?'on':''}"><span class="desktop-label">管理中心</span><span class="mobile-label">管理</span></button></nav><button class="subtle" id="logout">登出 ↗</button></header><main id="main"></main>`;
  $$('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;render()});
  $('#logout').onclick=async()=>{
    captureView();await api('/logout','POST');captureView();detailRequests.cancel();
    clearInterval(generationPoll);generationPoll=null;liveFeed?.close();liveConversationId=null;
-   state.me=null;state.selected=null;state.detail=null;state.remoteRunning.clear();
+   state.me=null;state.selected=null;state.detail=null;state.stats=null;statsLoading=null;state.remoteRunning.clear();
    state.liveJobs.clear();state.liveAssistantIds.clear();login();
  };
 }
@@ -42,13 +60,15 @@ async function load(){
    const cid=localStorage.getItem('ai-station-last-conversation');
    if(cid&&state.conversations.some(c=>c.id===cid)){state.selected=cid;state.detail=await api('/conversations/'+cid)}
  }catch{}
- if(!generationPoll)generationPoll=setInterval(()=>syncGenerations().catch(()=>{}),2500);
+ updateGenerationPolling();
 }
 async function syncGenerations(){
- if(!state.me||pollBusy)return;
+ if(!state.me||document.hidden||pollBusy)return;
+ const session=state.me;
  pollBusy=true;
  try{
    const running=await api('/generations');
+   if(state.me!==session)return;
    const previous=state.remoteRunning;
    state.remoteRunning=new Set(running.active.map(x=>x.conversation_id));
    const finished=[...previous].filter(cid=>!state.remoteRunning.has(cid));
@@ -59,7 +79,7 @@ async function syncGenerations(){
    if(state.selected&&state.tab==='chat')renderQueue();
  }finally{pollBusy=false}
 }
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)syncGenerations().catch(()=>{})});
+document.addEventListener('visibilitychange',()=>{updateGenerationPolling();if(!document.hidden)syncGenerations().catch(()=>{})});
 const loadProviders=async()=>state.providers=await api('/providers');
 const loadModels=async()=>state.models=await api('/models');
 const loadConvos=async()=>state.conversations=await api('/conversations');
@@ -101,7 +121,7 @@ function bindThinkingControl(cid){
  select.onchange=change;
  budget.onchange=change;
 }
-function chatPage(){const c=state.detail,ready=!!c;$('#main').innerHTML=`<div class="workspace"><aside class="sidebar"><div class="side-head"><span class="eyebrow">YOUR CONVERSATIONS</span><button id="new" class="square" aria-label="新增對話" title="新增對話">＋</button></div><div class="history">${state.conversations.map(x=>`<button class="history-item ${state.selected===x.id?'active':''}" data-convo="${x.id}"><span>◫</span> <span class="history-title">${esc(x.title)}</span></button>`).join('')||'<p class="muted empty-side">還沒有對話紀錄。</p>'}</div><div class="side-foot"><span>✳</span> 私人專屬的思考空間</div></aside><section class="chat-section">${ready?`<div class="chat-top"><div><div class="eyebrow">CONVERSATION</div><h2>${esc(c.title)}</h2></div><div class="chat-actions"><button id="rename" class="subtle">重新命名</button><button id="deleteChat" class="subtle danger">刪除</button></div></div><div class="conversation-settings"><label>使用模型<select id="modelSelect">${modelOptions(c.provider_id,c.model_id)}</select></label><label class="system-label">System Prompt<textarea id="systemPrompt" rows="2" placeholder="設定本次對話的系統指令">${esc(c.system_prompt)}</textarea></label><button class="secondary" id="saveSystem">儲存設定</button></div><div class="messages" id="messages" data-conversation-id="${esc(c.id)}"></div><div class="latest-bar"><button id="jumpLatest" class="secondary" hidden>↓ 回到最新訊息</button></div><div class="composer-wrap"><div id="queue" class="queue"></div><div class="composer"><textarea id="compose" data-conversation-id="${esc(c.id)}" enterkeyhint="send" rows="2" placeholder="輸入你的想法… Enter 傳送，Shift + Enter 換行"></textarea><div class="composer-foot"><div class="composer-tools">${thinkingControl(c)}<span class="composer-caption">MARKDOWN · LATEX · CODE</span></div><div><button id="stop" class="secondary" ${isGenerating(c.id)?'':'hidden'}>■ 停止</button><button id="send" class="primary">傳送 ↗</button></div></div></div><p class="hint">每次請求完整傳送對話上下文 · 不包含圖片或附件</p></div>`:state.selected?`<div class="empty-chat" role="status"><p>${state.detailError?esc(state.detailError):'正在載入對話…'}</p>${state.detailError?'<button id="retryConversation" class="secondary">重試載入</button>':''}</div>`:`<div class="empty-chat"><span class="hero-mark spark">✳</span><div class="eyebrow">A SPACE FOR YOUR IDEAS</div><h1>今天，有什麼新想法？</h1><p>開啟一段對話，讓思路自由延伸。</p><button class="primary" id="startNew">建立新對話　↗</button></div>`}</section></div>`;
+function chatPage(){const c=state.detail,ready=!!c;$('#main').innerHTML=`<div class="workspace"><aside class="sidebar"><div class="side-head"><span class="eyebrow">YOUR CONVERSATIONS</span><button id="new" class="square" aria-label="新增對話" title="新增對話">＋</button></div><div class="history">${state.conversations.map(x=>`<button class="history-item ${state.selected===x.id?'active':''}" data-convo="${x.id}"><span>◫</span> <span class="history-title">${esc(x.title)}</span></button>`).join('')||'<p class="muted empty-side">還沒有對話紀錄。</p>'}</div><div class="side-foot"><span>✳</span> 私人專屬的思考空間</div></aside><section class="chat-section">${ready?`<div class="chat-top"><div><div class="eyebrow">CONVERSATION</div><h2>${esc(c.title)}</h2></div><div class="chat-actions"><button id="rename" class="subtle">重新命名</button><button id="deleteChat" class="subtle danger">刪除</button></div></div><div class="conversation-settings"><label>使用模型<select id="modelSelect">${modelOptions(c.provider_id,c.model_id)}</select></label><label class="system-label">System Prompt<textarea id="systemPrompt" rows="2" placeholder="設定本次對話的系統指令">${esc(c.system_prompt)}</textarea></label><button class="secondary" id="saveSystem">儲存設定</button></div><div id="formatNotice" class="format-notice" role="status" hidden></div><div class="messages" id="messages" data-conversation-id="${esc(c.id)}"></div><div class="latest-bar"><button id="jumpLatest" class="secondary" hidden>↓ 回到最新訊息</button></div><div class="composer-wrap"><div id="queue" class="queue"></div><div class="composer"><textarea id="compose" data-conversation-id="${esc(c.id)}" enterkeyhint="send" rows="2" placeholder="輸入你的想法… Enter 傳送，Shift + Enter 換行"></textarea><div class="composer-foot"><div class="composer-tools">${thinkingControl(c)}<span class="composer-caption">MARKDOWN · LATEX · CODE</span></div><div><button id="stop" class="secondary" ${isGenerating(c.id)?'':'hidden'}>■ 停止</button><button id="send" class="primary">傳送 ↗</button></div></div></div><p class="hint">每次請求完整傳送對話上下文 · 不包含圖片或附件</p></div>`:state.selected?`<div class="empty-chat" role="status"><p>${state.detailError?esc(state.detailError):'正在載入對話…'}</p>${state.detailError?'<button id="retryConversation" class="secondary">重試載入</button>':''}</div>`:`<div class="empty-chat"><span class="hero-mark spark">✳</span><div class="eyebrow">A SPACE FOR YOUR IDEAS</div><h1>今天，有什麼新想法？</h1><p>開啟一段對話，讓思路自由延伸。</p><button class="primary" id="startNew">建立新對話　↗</button></div>`}</section></div>`;
  $('#new').onclick=makeConvo;if($('#startNew'))$('#startNew').onclick=makeConvo;
  $$('[data-convo]').forEach(b=>b.onclick=()=>openConvo(b.dataset.convo));
  if($('#retryConversation'))$('#retryConversation').onclick=()=>openConvo(state.selected);
@@ -140,6 +160,7 @@ function messageHTML(m,req,record){
  const background=m.status==='running'&&!m.live;
  const content=background?'背景生成中，完成後會自動顯示完整回覆。':m.content;
  const thinking=background?'':m.thinking_content;
+ if(record.formatVersion!==formatVersion){record.content=undefined;record.thinking=undefined;record.formatVersion=formatVersion}
  if(record.content!==content){record.content=content;record.html=renderMarkdown(content)}
  if(record.thinking!==thinking){record.thinking=thinking;record.thinkingHTML=thinking?renderMarkdown(thinking):''}
  return `<article class="message ${m.role}" data-message-id="${esc(m.id)}"><div class="avatar">${m.role==='user'?'你':'✳'}</div><div class="message-body"><div class="message-name">${m.role==='user'?'YOU':'AI STATION'} ${m.status==='running'?'<span class="working">正在生成…</span>':''}</div>${m.role==='assistant'&&thinking?`<details class="thinking-panel" data-thinking-id="${esc(m.id)}" ${(state.thinkingExpanded.get(m.id)??(m.status==='running'))?'open':''}><summary><span>✳ 模型提供的思考內容／摘要</span><span class="thinking-chevron">⌄</span></summary><div class="thinking-body">${record.thinkingHTML}</div></details>`:''}<div class="prose">${record.html}</div>${req?.status==='error'?`<details class="error-detail"><summary>錯誤 ${esc(req.http_status??'未知')} · ${esc(req.provider_error_code||'unknown')} — 展開詳情</summary><div>請求時間：${esc(req.started_at)}</div><pre>${esc(req.error_body)}</pre></details>`:''}${req&&req.status!=='running'?`<div class="usage">思考額度：${esc(describeThinking({mode:req.thinking_mode,effort:req.thinking_effort,budget_tokens:req.thinking_budget_tokens}))} · 輸入 ${fmt(req.input_tokens)} · 輸出 ${fmt(req.output_tokens)} · 快取讀取 ${fmt(req.cache_read_tokens)} · 推理 ${fmt(req.reasoning_tokens)} · ${esc(req.status)}</div>`:''}</div></article>`;
@@ -151,6 +172,7 @@ function updateJumpButton(el){
 function renderMessages(changedIds=null){
  const el=$('#messages'),c=state.detail;
  if(!el||!c||el.dataset.conversationId!==c.id)return;
+ updateFormatNotice();
  const fresh=renderedContainer!==el;
  const position=fresh?(messagePositions.get(c.id)||{top:0,follow:true}):{top:el.scrollTop,follow:messagePositions.get(c.id)?.follow??true};
  if(fresh){
@@ -165,13 +187,14 @@ function renderMessages(changedIds=null){
  const editable=!isGenerating(c.id);
  for(const m of messages){
    const req=requests.get(m.id),record=messageNodes.get(m.id)||{};
-   const signature=JSON.stringify([m.role,m.status,!!m.live,m.content,m.thinking_content,req,state.editingMessage===m.id,editable]);
+   if(record.editing&&state.editingMessage===m.id)continue;
+   const signature=JSON.stringify([formatVersion,m.role,m.status,!!m.live,m.content,m.thinking_content,req,state.editingMessage===m.id,editable]);
    if(record.signature===signature)continue;
    const template=document.createElement('template');
    template.innerHTML=messageHTML(m,req,record);
    const node=template.content.firstElementChild;
    $$('pre code',node).forEach(code=>{
-     hljs.highlightElement(code);
+     markdownRenderer?.highlight(code);
      const button=document.createElement('button');button.className='copy';button.textContent='複製';
      button.onclick=async()=>{try{await navigator.clipboard.writeText(code.textContent);button.textContent='已複製'}catch(e){alert('複製失敗：'+e.message)}};
      code.parentNode.prepend(button);
@@ -180,7 +203,7 @@ function renderMessages(changedIds=null){
    bindMessageActions(node,c,m);
    if(record.node)record.node.replaceWith(node);
    else{el.querySelector('.messages-empty')?.remove();el.append(node)}
-   record.node=node;record.signature=signature;messageNodes.set(m.id,record);
+   record.node=node;record.signature=signature;record.editing=state.editingMessage===m.id;messageNodes.set(m.id,record);
  }
  if(!changedIds){
    const ids=new Set(c.messages.map(m=>m.id));
@@ -449,12 +472,23 @@ function adminPage(){const s=state.stats||{requests:{count:0},usage:{},recent:[]
  $('#saveDefault').onclick=async()=>{await api('/settings','PATCH',{default_system_prompt:$('#defaultSystem').value});alert('已儲存')};
  $('#exportChats').onclick=()=>location.href='/api/export?type=chats';$('#exportSettings').onclick=()=>location.href='/api/export?type=settings';
 }
-async function adminRefresh(){state.stats=await api('/stats');render()}
+async function adminRefresh(){
+ const session=state.me,stats=await api('/stats');if(state.me!==session)return;
+ state.stats=stats;if(state.tab==='admin')render();
+}
 function render(){
  captureView();clearTimeout(messageRenderTimer);messageRenderTimer=null;dirtyMessages.clear();
  shell();
  if(state.tab==='chat'){chatPage();if(state.detail&&state.selected!==liveConversationId)subscribeConversation(state.selected,state.detail.event_cursor)}
  else{liveFeed?.close();liveConversationId=null;adminPage();adminRefreshOnce()}
 }
-async function adminRefreshOnce(){if(!state.stats){state.stats=await api('/stats');adminPage()}}
+let statsLoading=null;
+async function adminRefreshOnce(){
+ if(state.stats||statsLoading)return;
+ const session=state.me;
+ const task=api('/stats');statsLoading=task;
+ try{const stats=await task;if(state.me!==session)return;state.stats=stats;if(state.tab==='admin')adminPage()}
+ catch(e){if(state.me===session&&state.tab==='admin')alert('用量暫時無法載入：'+e.message)}
+ finally{if(statsLoading===task)statsLoading=null}
+}
 (async()=>{try{await load();render()}catch{login()}})();

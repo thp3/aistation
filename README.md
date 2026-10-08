@@ -14,6 +14,10 @@ npm start
 
 使用瀏覽器開啟 `http://127.0.0.1:3000`。要開放外部連線請配置 `HOST=0.0.0.0`、`PORT=3000` 和防火牆。
 
+## 本機開發
+
+配置好 `.env` 並安裝套件後，在兩個終端機分別執行 `npm start`（API 後端）與 `npm run dev`（Vite 前端），瀏覽器開啟 Vite 顯示的網址。Vite 的 `/api` 代理預設連至 `http://127.0.0.1:<PORT>`，沿用 `.env` 中的 PORT；後端位於其他網址時可設定 `DEV_API_TARGET`。代理保留瀏覽器的 Host，讓登入 Cookie 與 Origin 檢查可正常運作。此設定只供開發使用。
+
 ## VPS 一鍵安裝 / 更新（Linux/systemd）
 
 ```bash
@@ -35,7 +39,13 @@ sudo systemctl status aistation
 - 手機版持續顯示「＋」新增對話按鈕，使用動態視窗高度、適配安全區域及觸控輸入字級。軟鍵盤、瀏覽器工具列和安全區域仍需在實際手機確認。
 - 正式建置的帶內容雜湊 JS、CSS 與字型檔可長期快取；HTML、登入及私人 API 仍使用 `no-store`。
 
-開發驗證：`npm run check`、`npm test`、`npm run build`。另外提供 `npm run test:ui` 瀏覽器回歸測試，覆蓋草稿、延遲送出確認、切換競爭、串流 DOM／捲動保留、手機新增入口與 HTTP 快取。需先建置並另備 Playwright（例如 `npm install --no-save --package-lock=false playwright` 和 `npx playwright install chromium`）；也可用 `PLAYWRIGHT_MODULE` 指定既有 Playwright 的 `index.mjs` 路徑，或以 `PLAYWRIGHT_CHANNEL=chrome` 使用已安裝的 Chrome。
+- Markdown 解析在第一則非空訊息出現時才載入；KaTeX 僅在數學公式出現時載入，程式碼高亮僅在程式碼區塊出現時載入。載入期間先顯示可閱讀的文字，格式載入完成會保留捲動位置及正在編輯的歷史訊息。下載失敗時保留文字並提供重新整理入口，輸入框草稿仍會保存。
+- 程式碼高亮使用 Highlight.js 的常用語言集，另加入 PowerShell 和 Dockerfile。未標示語言、不支援的語言或超過 50000 字元的區塊保留純文字與複製功能，避免串流期間反覆自動偵測語言。公式解析遵循 Markdown 的程式碼區塊／行內程式碼規則，不會把其中的 `$...$` 當成公式。
+- 分頁隱藏時暫停生成狀態的定時查詢，回到前景立即同步；伺服器背景生成仍繼續。管理中心延遲回傳的統計不會覆蓋已切換的聊天畫面。
+- 移除會被目前 CSP 阻擋的外部 Google Fonts 載入；介面使用既有的系統字型備援，數學字型仍由本機建置資產提供。
+
+
+開發驗證：`npm run check`、`npm test`、`npm run build`。另外提供 `npm run test:ui` 瀏覽器回歸測試，覆蓋草稿、延遲送出確認、切換競爭、串流 DOM／捲動保留、手機新增入口、HTTP 快取、延遲格式載入與失敗恢復、隱藏分頁輪詢、管理中心切頁及開發 API 代理。需先建置並另備 Playwright（例如 `npm install --no-save --package-lock=false playwright` 和 `npx playwright install chromium`）；也可用 `PLAYWRIGHT_MODULE` 指定既有 Playwright 的 `index.mjs` 路徑，或以 `PLAYWRIGHT_CHANNEL=chrome` 使用已安裝的 Chrome。
 
 ## 端點與模型設定
 

@@ -44,12 +44,14 @@ function conversation(id){
   return {id,title:id==='a'?'對話 A':'對話 B',provider_id:'p',model_id:'model-one',system_prompt:'',requests:[],
     messages:[],queue:{paused:false,jobs:[]},event_cursor:0};
 }
-async function fixture(t,{mobile=false,long=false}={}){
+async function fixture(t,{mobile=false,long=false,messages=null,preparePage=null}={}){
   const context=await browser.newContext({viewport:mobile?{width:390,height:844}:{width:1100,height:850},...(mobile?{isMobile:true,hasTouch:true}:{})});
   t.after(()=>context.close());
   const page=await context.newPage(),errors=[],chats={a:conversation('a'),b:conversation('b')};
   if(long)chats.a.messages=Array.from({length:30},(_,i)=>({id:'m'+i,role:i%2?'assistant':'user',status:'complete',content:i%2?'歷史內容\n\n```js\nconst value = 1;\n```':'歷史問題 '+i,thinking_content:''}));
-  const sent=[];let onDetail=null,onSend=null;
+  if(messages)chats.a.messages=messages;
+  const assets=[],sent=[];let onDetail=null,onSend=null,onStats=null,generationCalls=0;
+  page.on('request',request=>{if(request.url().includes('/assets/'))assets.push(request.url())});
   page.on('pageerror',error=>errors.push(error.message));
   page.on('dialog',dialog=>dialog.dismiss());
   await page.addInitScript(()=>{
@@ -69,8 +71,8 @@ async function fixture(t,{mobile=false,long=false}={}){
     if(uri==='/providers')return respond([{id:'p',name:'測試端點',protocol:'openai'}]);
     if(uri==='/models')return respond(['model-one','model-two'].map((model_id,i)=>({id:'model-'+i,provider_id:'p',provider_name:'測試端點',model_id,protocol:'openai',enabled:1})));
     if(uri==='/settings')return respond({default_system_prompt:'',naming_model_id:''});
-    if(uri==='/generations')return respond({active:[]});
-    if(uri==='/stats')return respond({requests:{count:0},usage:{},recent:[]});
+    if(uri==='/generations'){generationCalls++;return respond({active:[]})}
+    if(uri==='/stats'){if(onStats)await onStats();return respond({requests:{count:0},usage:{},recent:[]})}
     if(uri==='/conversations'&&method==='GET')return respond(Object.values(chats).map(({messages,requests,queue,...rest})=>rest));
     if(uri==='/conversations'&&method==='POST'){chats.new={...conversation('new'),title:'新的對話'};return respond(chats.new)}
     const history=uri.match(/^\/conversations\/([^/]+)\/messages\/([^/]+)$/);
@@ -95,8 +97,10 @@ async function fixture(t,{mobile=false,long=false}={}){
     }
     throw Error('Unexpected API '+uri);
   });
+  if(preparePage)await preparePage(page);
   await page.goto(base);await page.waitForSelector('#compose');
-  return {page,chats,sent,errors,setDetail:fn=>{onDetail=fn},setSend:fn=>{onSend=fn}};
+  if(long)await page.waitForSelector('pre code.hljs');
+  return {page,chats,sent,errors,assets,generationCalls:()=>generationCalls,setDetail:fn=>{onDetail=fn},setSend:fn=>{onSend=fn},setStats:fn=>{onStats=fn}};
 }
 
 test('drafts survive model changes, page switches, conversation changes and reloads',async t=>{
@@ -219,4 +223,100 @@ test('only public hashed assets are cached; HTML and private API responses remai
   const asset=(await html.text()).match(/src="([^"]+\.js)"/)[1];
   const js=await fetch(base+asset);assert.equal(js.headers.get('cache-control'),'public, max-age=31536000, immutable');
   const privateResponse=await fetch(base+'/api/me');assert.equal(privateResponse.headers.get('cache-control'),'no-store');
+});
+
+
+test('empty chats avoid renderer downloads; code and math load independently and sanitized markdown stays safe',async t=>{
+  const {page,chats,assets,errors}=await fixture(t);
+  assert.ok(!assets.some(url=>/\/(markdown|highlight|math)-/.test(url)));
+  chats.a.messages=[{id:'rich',role:'assistant',status:'complete',content:'# 標題\n\n**粗體** <img src="x" onerror="window.__unsafe=true">\n\n```javascript\nconst literal = "$code$";\n```\n\n`$inlineCode$`',thinking_content:''}];
+  await page.locator('[data-convo="b"]').click();await page.waitForFunction(()=>document.querySelector('#compose')?.dataset.conversationId==='b');
+  await page.locator('[data-convo="a"]').click();
+  await page.waitForSelector('[data-message-id="rich"] code .hljs-keyword');
+  assert.equal(await page.locator('[data-message-id="rich"] strong').textContent(),'粗體');
+  assert.ok(assets.some(url=>/\/markdown-/.test(url)));
+  assert.ok(assets.some(url=>/\/highlight-/.test(url)));
+  assert.ok(!assets.some(url=>/\/math-/.test(url)),'Dollars inside code must not load/render math');
+  assert.equal(await page.locator('[data-message-id="rich"] pre code').textContent(),'const literal = "$code$";\n');
+  assert.equal(await page.locator('[data-message-id="rich"] [onerror]').count(),0);
+  assert.equal(await page.evaluate(()=>window.__unsafe),undefined);
+  chats.a.messages[0].content='公式 $x^2$\n\n$$\n\\frac{1}{2}\n$$';
+  await page.locator('[data-convo="b"]').click();await page.waitForFunction(()=>document.querySelector('#compose')?.dataset.conversationId==='b');
+  await page.locator('[data-convo="a"]').click();await page.waitForSelector('.katex-display');
+  assert.equal(await page.locator('.katex').count(),2);
+  assert.ok(assets.some(url=>/\/math-/.test(url)));assert.deepEqual(errors,[]);
+});
+
+test('late renderer loading keeps plaintext readable and preserves an in-progress history edit',async t=>{
+  let release;const gate=new Promise(resolve=>release=resolve);
+  const {page,errors}=await fixture(t,{messages:[{id:'slow-format',role:'assistant',status:'complete',content:'**原文**',thinking_content:''}],
+    preparePage:page=>page.route('**/assets/markdown-*.js',async route=>{await gate;await route.continue()})});
+  assert.equal(await page.locator('.plain-message').textContent(),'**原文**');
+  await page.locator('[data-message-id="slow-format"]').getByRole('button',{name:'編輯',exact:true}).click();
+  await page.locator('[data-editing-message] textarea').fill('還沒儲存的編輯內容');
+  const formatted=page.waitForResponse(response=>/\/markdown-.*\.js/.test(response.url()));
+  release();await formatted;await sleep(200);
+  assert.equal(await page.locator('[data-editing-message] textarea').inputValue(),'還沒儲存的編輯內容');
+  await page.getByRole('button',{name:'取消',exact:true}).click();
+  await page.waitForSelector('[data-message-id="slow-format"] strong');assert.deepEqual(errors,[]);
+});
+
+test('a delayed admin stats response cannot overwrite the selected chat page',async t=>{
+  const {page,setStats,errors}=await fixture(t);
+  let release;const gate=new Promise(resolve=>release=resolve);setStats(()=>gate);
+  const statsRequest=page.waitForRequest(request=>request.url().endsWith('/api/stats'));
+  await page.locator('[data-tab="admin"]').click();await page.waitForSelector('#providerForm');await statsRequest;
+  await page.locator('[data-tab="chat"]').click();await page.waitForSelector('#compose');
+  const statsResponse=page.waitForResponse(response=>response.url().endsWith('/api/stats'));
+  release();await statsResponse;await sleep(100);
+  assert.ok(await page.locator('#compose').isVisible());assert.equal(await page.locator('#providerForm').count(),0);assert.deepEqual(errors,[]);
+});
+
+test('generation polling pauses while hidden and resumes immediately on return',async t=>{
+  const {page,generationCalls,errors}=await fixture(t);
+  await page.evaluate(()=>{
+    window.__testHidden=true;Object.defineProperty(document,'hidden',{configurable:true,get:()=>window.__testHidden});
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  const before=generationCalls();await sleep(2900);assert.equal(generationCalls(),before);
+  const resumed=page.waitForResponse(response=>response.url().endsWith('/api/generations'));
+  await page.evaluate(()=>{window.__testHidden=false;document.dispatchEvent(new Event('visibilitychange'))});
+  await resumed;assert.equal(generationCalls(),before+1);assert.deepEqual(errors,[]);
+});
+
+test('Vite dev proxy forwards login, cookies and Origin with the configured backend port',async t=>{
+  const socket=createServer();socket.listen(0,'127.0.0.1');await once(socket,'listening');
+  const port=socket.address().port;await new Promise(resolve=>socket.close(resolve));
+  const devBase='http://127.0.0.1:'+port;
+  const vite=spawn(process.execPath,['node_modules/vite/bin/vite.js','--host','127.0.0.1','--port',String(port),'--strictPort'],{
+    cwd:path.resolve(import.meta.dirname,'..'),windowsHide:true,env:{...process.env,DEV_API_TARGET:base},stdio:['ignore','pipe','pipe']});
+  let stderr='';vite.stderr.on('data',data=>stderr+=data);vite.stdout.on('data',()=>{});
+  t.after(async()=>{vite.kill();if(vite.exitCode===null)await Promise.race([once(vite,'exit'),sleep(3000)])});
+  let ready=false;
+  for(let i=0;i<100;i++){
+    if(vite.exitCode!==null)throw Error(stderr);
+    try{if((await fetch(devBase+'/api/me')).status===401){ready=true;break}}catch{}
+    await sleep(50);
+  }
+  assert.ok(ready,stderr);
+  const login=await fetch(devBase+'/api/login',{method:'POST',headers:{Origin:devBase,'Content-Type':'application/json'},
+    body:JSON.stringify({username:'uitest',password:'ui-test-password-at-least-12'})});
+  assert.equal(login.status,200,await login.text());
+  const cookie=login.headers.get('set-cookie').split(';')[0];
+  assert.match(cookie,/^session=/);
+  const me=await fetch(devBase+'/api/me',{headers:{Cookie:cookie}});assert.equal(me.status,200);
+  assert.equal((await me.json()).username,'uitest');
+});
+
+
+test('renderer download failures keep text usable and recover on reload without losing the compose draft',async t=>{
+  let attempts=0;
+  const {page,errors}=await fixture(t,{messages:[{id:'retry-format',role:'assistant',status:'complete',content:'**重要文字**',thinking_content:''}],
+    preparePage:page=>page.route('**/assets/markdown-*.js',route=>{attempts++;return attempts===1?route.abort('failed'):route.continue()})});
+  await page.waitForSelector('#retryFormat');
+  assert.equal(await page.locator('.plain-message').textContent(),'**重要文字**');
+  await page.locator('#compose').fill('重新整理仍保留的草稿');
+  await page.locator('#retryFormat').click();await page.waitForSelector('[data-message-id="retry-format"] strong',{timeout:5000});
+  assert.equal(await page.locator('#compose').inputValue(),'重新整理仍保留的草稿');
+  assert.equal(await page.locator('#formatNotice').isVisible(),false);assert.deepEqual(errors,[]);
 });
